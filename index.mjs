@@ -229,7 +229,16 @@ async function balance(provider, auth) {
       return { ok: false, why: msg || "refused" };
     }
     if (!res.ok) return { ok: false, why: `HTTP ${res.status}` };
-    if (!json) return { ok: false, why: String(text).slice(0, 80) };
+    // The site sits behind a WAF that answers an HTML challenge page with
+    // 200 instead of the JSON: saying "<!doctype html>" back to the user
+    // hides the real problem, which is that the read was blocked and will
+    // work again later.
+    if (!json) {
+      if (/^\s*<(?:!doctype|html)/i.test(String(text))) {
+        return { ok: false, why: "blocked", blocked: true };
+      }
+      return { ok: false, why: String(text).slice(0, 80) };
+    }
     const d = json.data ?? {};
     const quota = Number(d.quota ?? 0);
     const used = Number(d.used_quota ?? 0);
@@ -254,20 +263,46 @@ async function usageOf(getAuth, provider) {
         ? "AgentRouter：未填写站点「访问令牌」，无法读取余额（个人设置 → 访问令牌）"
         : b.expired
           ? "AgentRouter：访问令牌已失效，请到站点「个人设置 → 访问令牌」重新生成并填写"
-          : b.why === "no-quota"
-            ? "AgentRouter：站点没有返回额度字段"
-            : `AgentRouter：无法读取余额（${b.why}）`;
+          : b.blocked
+            ? "AgentRouter：站点风控拦截了余额查询（返回验证页），稍后会自动恢复"
+            : b.why === "no-quota"
+              ? "AgentRouter：站点没有返回额度字段"
+              : `AgentRouter：无法读取余额（${b.why}）`;
     return { error: why, windows: [] };
   }
   const bal = b.balance;
   // The site counts in 1/500000 dollars unless it says otherwise.
   const rate = Number(provider?.quotaPerUnit ?? 500000) || 500000;
   const dollars = (n) => Math.round((n / rate) * 100) / 100;
+
+  // New API's fields, as the site's own dashboard labels them:
+  //   quota      the balance left now      ("当前余额")
+  //   used_quota what has been spent       ("历史消耗")
+  //   both       the credit the account was given
+  // magpie's window wants Used and Remaining as *percent*, with the counts
+  // beside them in Amount/Limit/Unit — putting the dollars into Used is what
+  // made a $326.70 balance read as "0% left" (2265.25 was taken for a
+  // percentage). So the percent is computed here and the dollars go where
+  // magpie shows counts.
+  const left = dollars(bal.quota);
+  const spent = dollars(bal.used);
+  const whole = dollars(bal.total);
+  const usedPct = whole > 0 ? Math.min(100, Math.max(0, (spent / whole) * 100)) : 0;
+  const remainingPct = Math.max(0, 100 - usedPct);
+
   return {
     plan: bal.name || undefined,
-    balance: dollars(bal.quota),
+    balance: left,
     windows: [
-      { name: "Balance", used: dollars(bal.used), limit: dollars(bal.total), remaining: dollars(bal.quota) },
+      {
+        name: "Balance",
+        used: Math.round(usedPct * 10) / 10,
+        remaining: Math.round(remainingPct * 10) / 10,
+        amount: spent,
+        limit: whole,
+        unit: "usd",
+        display: `$${left.toFixed(2)} / $${whole.toFixed(2)}`,
+      },
     ],
   };
 }
