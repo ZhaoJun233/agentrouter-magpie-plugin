@@ -1,6 +1,7 @@
 // AgentRouter (agentrouter.org) for magpie / OpenCode.
 //
-// Two things make this vendor different from a plain OpenAI-compatible relay:
+// Three things make this vendor different from a plain OpenAI-compatible
+// relay:
 //
 // 1. Its gateway only answers a client it recognises. A request whose
 //    User-Agent is curl's (or anything else off its list) is refused with
@@ -9,17 +10,31 @@
 //    through. They are configurable — per provider and per account — and
 //    the defaults are the ones the vendor's own clients send.
 //
-// 2. It has no check-in endpoint of its own. The site is a New API
-//    deployment, whose daily reward is claimed by GET /api/user/checkin,
-//    and that route wants the *user* access token (the one on the site's
-//    profile page), not the sk- API key used for completions. The API key
-//    cannot claim it: /api/user/* answers "access token 无效" for an sk-
-//    key. So an account signs in with both when it has both: the key for
-//    completions, the access token for the balance and the check-in.
+// 2. It has no daily check-in to call. The site is a New API deployment,
+//    and most New API sites put one on GET /api/user/checkin. This one
+//    does not: that path falls through to New API's *admin* route
+//    /api/user/:id, which answers "权限不足" to every ordinary account —
+//    the same answer it gives /api/user/foo or /api/user/zzz. The daily
+//    credit is granted at sign-in instead (the site's login response
+//    carries checked_in, and its settings keep DailyCheckinQuota), so
+//    there is nothing for a plugin to claim after the fact. The check-in
+//    hook therefore reports "no check-in here" rather than a day's
+//    result, and never retries.
 //
-// Signing in with only the key is allowed and gives a working provider —
-// the check-in then reports that it needs the access token, rather than
-// pretending the day was claimed.
+// 3. Its balance is behind a WAF. /api/user/self is the only route that
+//    carries the account's quota, and from a server the site answers it
+//    with an Aliyun slider-captcha page instead of JSON. The slider is
+//    solved by a person in a browser, so the balance read fails with a
+//    reason that says so, and works again once the site lets the address
+//    through. The routes that do answer without a captcha carry no
+//    account balance: /api/token/ is one API key's own quota (negative
+//    when the key is unlimited), /v1/dashboard/billing/usage is that
+//    key's spend, and /api/log/self is a ledger. None of them is the
+//    account's balance, so none of them is used as one.
+//
+// Signing in with only the key is allowed and gives a working provider.
+// The access token is only for the balance read; without it that read
+// says which page to copy it from.
 
 const PROVIDER = "agentrouter";
 
@@ -173,18 +188,64 @@ function headersText(auth) {
   return String(meta(auth, "headers") ?? "");
 }
 
+// cookieText is the browser cookie the account copied from the site.
+//
+// It is what gets past the WAF: /api/user/self answers a server with an
+// Aliyun slider captcha, and the cookie a browser holds after a person has
+// slid it is the proof the WAF wants. A password sign-in does not produce
+// one — the WAF challenge is per address, not per account — so the cookie is
+// the only credential that carries a real browser's clearance.
+function cookieText(auth) {
+  return String(meta(auth, "cookie") ?? "").trim();
+}
+
+// parseCookies turns the text a browser shows for a site ("a=1; b=2", or
+// the tab-separated lines of a devtools cookie table) into a Cookie header.
+// A name repeated keeps its last value, as the browser's own send would.
+function parseCookies(text) {
+  const out = [];
+  const seen = new Map();
+  for (const raw of String(text ?? "").split(/\r?\n|;/)) {
+    const s = raw.trim();
+    if (!s || s.startsWith("#")) continue;
+    // A devtools row is "name<TAB>value<TAB>domain…"; a plain pair is
+    // "name=value". Both keep only the first two fields.
+    const cols = s.split("\t");
+    let name, value;
+    if (cols.length > 1) {
+      name = cols[0].trim();
+      value = (cols[1] ?? "").trim();
+    } else {
+      const at = s.indexOf("=");
+      if (at < 1) continue;
+      name = s.slice(0, at).trim();
+      value = s.slice(at + 1).trim();
+    }
+    if (!name) continue;
+    if (seen.has(name)) out[seen.get(name)] = `${name}=${value}`;
+    else {
+      seen.set(name, out.length);
+      out.push(`${name}=${value}`);
+    }
+  }
+  return out.join("; ");
+}
+
 // siteName is the site the account signed in to.
 function siteName(auth) {
   return String(meta(auth, "site") ?? "org");
 }
 
-// userHeaders are what a /api/user call carries: the access token, and the
-// user id when the account knows it.
+// userHeaders are what a /api/user call carries: the access token, the user
+// id when the account knows it, and the browser cookie that gets past the
+// WAF when the account has one.
 function userHeaders(provider, auth) {
   const h = headersOf(provider, auth);
   h.Authorization = userToken(auth);
   delete h["Content-Type"];
   if (userId(auth)) h["New-Api-User"] = userId(auth);
+  const cookie = parseCookies(cookieText(auth));
+  if (cookie) h.Cookie = cookie;
   return h;
 }
 
@@ -205,15 +266,204 @@ async function jsonOrText(res) {
   }
 }
 
-// balance asks the site for the account's quota. New API answers
-// /api/user/self with the user record, whose quota and used_quota are in
-// the site's own units (1/500000 of a dollar on most deployments).
+// ---- signing in with GitHub ---------------------------------------------------
+
+// oauthState asks the site for the state its GitHub sign-in expects. The site
+// issues it and later checks it on the callback, so it can't be made up here.
+async function oauthState(base) {
+  try {
+    const res = await fetch(`${base}/api/oauth/state?mode=login`, {
+      headers: DEFAULT_HEADERS,
+      signal: withTimeout(REQUEST_TIMEOUT),
+    });
+    const { json } = await jsonOrText(res);
+    const st = String(json?.data ?? "").trim();
+    if (!json?.success || !st) return { ok: false, why: "站点没有下发 OAuth state" };
+    return { ok: true, state: st };
+  } catch (e) {
+    return { ok: false, why: `拿不到 OAuth state：${e?.message ?? String(e)}` };
+  }
+}
+
+// githubClientId is the site's own GitHub app id, from the site's status: the
+// authorize page must be opened for the app whose callback the site owns.
+async function githubClientId(base) {
+  try {
+    const res = await fetch(`${base}/api/status`, {
+      headers: DEFAULT_HEADERS,
+      signal: withTimeout(REQUEST_TIMEOUT),
+    });
+    const { json } = await jsonOrText(res);
+    const id = String(json?.data?.github_client_id ?? "").trim();
+    if (!id) return { ok: false, why: "站点没有开启 GitHub 登录" };
+    return { ok: true, id };
+  } catch (e) {
+    return { ok: false, why: `读不到站点配置：${e?.message ?? String(e)}` };
+  }
+}
+
+// codeOf pulls the code out of what the user pasted: the whole callback URL
+// (…/oauth/github?code=abc&state=…), or the code alone.
+function codeOf(pasted) {
+  const s = String(pasted ?? "").trim();
+  if (!s) return "";
+  const m = /[?&]code=([^&#\s]+)/.exec(s);
+  if (m) {
+    try {
+      return decodeURIComponent(m[1]);
+    } catch {
+      return m[1];
+    }
+  }
+  // A bare code has no URL around it; anything with spaces or a scheme is
+  // not one.
+  if (/^[A-Za-z0-9_-]{8,}$/.test(s)) return s;
+  return "";
+}
+
+// redeemGithub trades the code for the site's sign-in. The answer is the user
+// record: `access_token` is what the /api/user routes take, `quota` is the
+// balance, and `checked_in` says whether this sign-in granted the day's
+// credit. The account keeps all of it, so nothing else has to be typed in.
+async function redeemGithub(base, code, state, inputs) {
+  let json;
+  try {
+    const res = await fetch(
+      `${base}/api/oauth/github?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}&mode=login`,
+      { headers: DEFAULT_HEADERS, signal: withTimeout(REQUEST_TIMEOUT) },
+    );
+    ({ json } = await jsonOrText(res));
+  } catch (e) {
+    return { type: "failed", error: `兑换授权失败：${e?.message ?? String(e)}` };
+  }
+  if (!json?.success) {
+    return { type: "failed", error: String(json?.message ?? "GitHub 授权失败") };
+  }
+  const d = json.data ?? {};
+  const token = String(d.access_token ?? "").trim();
+  const id = d.id ?? "";
+  if (!token) return { type: "failed", error: "站点没有返回访问令牌" };
+
+  // The completions key is not in this answer, so it is read with the token
+  // that is: the account's own key list. A site that refuses leaves the key
+  // empty, and the account then reads as signed in but unable to chat, which
+  // its row says.
+  const key = await keyOf(base, token, id);
+  return {
+    type: "success",
+    // magpie saves this as an API sign-in: the key for completions, the
+    // access token beside it for the balance and the check-in.
+    key: key ?? "",
+    metadata: {
+      accessToken: token,
+      userId: String(id ?? ""),
+      site: String(inputs?.site ?? "org"),
+    },
+  };
+}
+
+// keyOf reads the account's sk- key with the access token just obtained.
+// /api/token/ is a normal user route and answers JSON, so it works where
+// /api/user/self may be behind the WAF.
+async function keyOf(base, token, id) {
+  try {
+    const res = await fetch(`${base}/api/token/?p=1&page_size=10`, {
+      headers: { ...DEFAULT_HEADERS, Authorization: token, "New-Api-User": String(id ?? "") },
+      signal: withTimeout(REQUEST_TIMEOUT),
+    });
+    const { json } = await jsonOrText(res);
+    const items = json?.data?.items;
+    if (!Array.isArray(items)) return "";
+    const live = items.find((x) => x && x.status === 1 && typeof x.key === "string") ?? items.find((x) => x && typeof x.key === "string");
+    const k = String(live?.key ?? "").trim();
+    return k.startsWith("sk-") ? k : "";
+  } catch {
+    return "";
+  }
+}
+
+// signIn is one POST to the site's login route, and it is the whole feature:
+// the login response carries both the day's check-in and the balance.
 //
-// It answers {ok, balance?, why?, expired?} rather than undefined, because
-// the reasons differ and only one of them is the user's to fix: a token the
-// site refuses needs a new one from the profile page, while a site that is
-// down is nothing to do with the account.
+// The vendor grants its daily credit at sign-in rather than through a route
+// of its own — its front end says "签到成功，新增额度已到账" when the login
+// response has checked_in — and that same response carries quota and
+// used_quota, the account's balance. So one call does both jobs, and it is
+// also the only way to read the balance from a server: /api/user/self, the
+// route New API normally reads it from, is the one this site's WAF answers
+// with a slider captcha, while /api/user/login is left alone.
+//
+// It answers {ok, checkedIn?, balance?, why?}. The caller decides whether a
+// false `ok` is the account's to fix (wrong password) or nobody's (the site
+// is down), so the reasons stay distinguishable here.
+async function signIn(provider, auth) {
+  const user = String(meta(auth, "username") ?? "").trim();
+  const pass = String(meta(auth, "password") ?? "");
+  if (!user || !pass) return { ok: false, why: "no-password" };
+  const h = headersOf(provider, auth);
+  h["Content-Type"] = "application/json";
+  delete h.Authorization;
+  let res;
+  try {
+    res = await fetch(`${siteBase(provider, auth)}/api/user/login`, {
+      method: "POST",
+      headers: h,
+      body: JSON.stringify({ username: user, password: pass }),
+      signal: withTimeout(REQUEST_TIMEOUT),
+    });
+  } catch (e) {
+    return { ok: false, why: `unreachable: ${e?.message ?? String(e)}` };
+  }
+  const { json, text } = await jsonOrText(res);
+  if (!json) {
+    if (/^\s*<(?:!doctype|html)/i.test(String(text))) return { ok: false, why: "blocked", blocked: true };
+    return { ok: false, why: `HTTP ${res.status}` };
+  }
+  if (json.success === false) {
+    const msg = String(json.message ?? json.msg ?? "");
+    // The site words a wrong password and a banned account the same way, so
+    // this is "the site refused these credentials", which is the account's
+    // to fix.
+    if (/密码|password|封禁|banned|错误/i.test(msg)) return { ok: false, why: "bad-password", message: msg };
+    return { ok: false, why: msg || "refused", message: msg };
+  }
+  const d = json.data ?? {};
+  const quota = Number(d.quota ?? NaN);
+  const used = Number(d.used_quota ?? NaN);
+  const balance =
+    Number.isFinite(quota) || Number.isFinite(used)
+      ? { quota: Number.isFinite(quota) ? quota : 0, used: Number.isFinite(used) ? used : 0 }
+      : undefined;
+  if (balance) balance.total = balance.quota + balance.used;
+  // `checked_in: true` means *this* sign-in granted the day's credit. A false
+  // means the day was already claimed, which is not a failure.
+  return { ok: true, checkedIn: d.checked_in === true, balance, name: d.username ?? d.display_name ?? "" };
+}
+
+// balance asks the site for the account's quota, by signing in. It answers
+// {ok, balance?, why?, expired?, blocked?} rather than undefined, because
+// the reasons differ and only one of them is the user's to fix: a refused
+// password needs a new one, while a site behind a captcha is nothing to do
+// with the account.
+//
+// The token route is tried first when the account has an access token, since
+// it is the cheaper read and works on a site that doesn't wall it. On this
+// one it is walled, so the sign-in is what actually answers.
 async function balance(provider, auth) {
+  const viaToken = await balanceByToken(provider, auth);
+  if (viaToken.ok) return viaToken;
+  const viaLogin = await signIn(provider, auth);
+  if (viaLogin.ok) return { ok: true, balance: viaLogin.balance };
+  // Report the reason the user can act on: a wrong password outranks a
+  // captcha, and a missing password means the token route's failure is the
+  // real one.
+  if (viaLogin.why === "bad-password") return { ok: false, why: "expired", expired: true, message: viaLogin.message };
+  if (viaLogin.why !== "no-password") return viaLogin;
+  return viaToken;
+}
+
+// balanceByToken reads /api/user/self with the account's access token.
+async function balanceByToken(provider, auth) {
   if (!userToken(auth)) return { ok: false, why: "no-token" };
   try {
     const res = await fetch(`${siteBase(provider, auth)}/api/user/self`, {
@@ -229,10 +479,10 @@ async function balance(provider, auth) {
       return { ok: false, why: msg || "refused" };
     }
     if (!res.ok) return { ok: false, why: `HTTP ${res.status}` };
-    // The site sits behind a WAF that answers an HTML challenge page with
-    // 200 instead of the JSON: saying "<!doctype html>" back to the user
-    // hides the real problem, which is that the read was blocked and will
-    // work again later.
+    // The site sits behind a WAF that answers an HTML slider-captcha page
+    // with 200 instead of the JSON: saying "<!doctype html>" back to the
+    // user hides the real problem, which is that the read was blocked and a
+    // sign-in is what gets past it.
     if (!json) {
       if (/^\s*<(?:!doctype|html)/i.test(String(text))) {
         return { ok: false, why: "blocked", blocked: true };
@@ -259,12 +509,12 @@ async function usageOf(getAuth, provider) {
   const b = await balance(provider, auth);
   if (!b.ok) {
     const why =
-      b.why === "no-token"
-        ? "AgentRouter：未填写站点「访问令牌」，无法读取余额（个人设置 → 访问令牌）"
-        : b.expired
-          ? "AgentRouter：访问令牌已失效，请到站点「个人设置 → 访问令牌」重新生成并填写"
-          : b.blocked
-            ? "AgentRouter：站点风控拦截了余额查询（返回验证页），稍后会自动恢复"
+      b.expired
+        ? "AgentRouter：站点拒绝了登录，请核对账号里的用户名和密码"
+        : b.blocked
+          ? "AgentRouter：余额接口被站点的滑动验证码拦截（阿里云 WAF）。在浏览器登录站点、滑过验证后，把 Cookie 填进账号即可读取"
+          : b.why === "no-token"
+            ? "AgentRouter：账号里没有访问令牌，也没有浏览器 Cookie，无法读取余额（个人设置 → 访问令牌）"
             : b.why === "no-quota"
               ? "AgentRouter：站点没有返回额度字段"
               : `AgentRouter：无法读取余额（${b.why}）`;
@@ -307,83 +557,46 @@ async function usageOf(getAuth, provider) {
   };
 }
 
-// checkin claims the day's reward. New API's route is a GET and answers
-// {success, message, data?}; a day already claimed answers success:false
-// with a message saying so, which is "done", not a failure to retry.
+// checkinOf claims the day's credit the only way this site grants one: by
+// signing in. The site has no /api/user/checkin — that path falls through to
+// New API's admin route /api/user/:id and answers every ordinary account
+// "权限不足", the same as /api/user/foo would — and its front end says
+// "签到成功，新增额度已到账" when a login response carries checked_in. So
+// signing in *is* the check-in, and the account needs the site password for
+// it, not the access token.
+//
+// What comes back is `claimed` when this sign-in granted the day, and `done`
+// when the day was already granted, which is what a second run reports. A
+// wrong password is the account's to fix and settles for the day; a site
+// that is down is retried, as magpie retries any `failed`.
 async function checkinOf(getAuth, provider) {
   const auth = await getAuth();
   if (!auth) return { outcome: "failed", message: "AgentRouter：尚未登录" };
-  if (!userToken(auth)) {
-    return {
-      outcome: "ineligible",
-      message:
-        "AgentRouter：每日签到需要站点「访问令牌」（个人设置 → 访问令牌），API 密钥不能签到",
-    };
+  const r = await signIn(provider, auth);
+  if (!r.ok) {
+    if (r.why === "no-password") {
+      return {
+        outcome: "ineligible",
+        message:
+          "AgentRouter：签到就是登录一次，需要在账号里填站点用户名和密码（个人设置 → 账号密码），访问令牌不能签到",
+      };
+    }
+    if (r.why === "bad-password") {
+      return {
+        outcome: "ineligible",
+        message: `AgentRouter：站点拒绝了登录，请核对账号里的用户名和密码（站点返回「${r.message ?? r.why}」）`,
+        signIn: "expired",
+      };
+    }
+    if (r.blocked) {
+      return { outcome: "failed", message: "AgentRouter：登录接口被站点验证码拦截，稍后重试" };
+    }
+    return { outcome: "failed", message: `AgentRouter：登录失败（${r.why}）` };
   }
-  const base = siteBase(provider, auth);
-  let res;
-  try {
-    res = await fetch(`${base}/api/user/checkin`, {
-      method: "GET",
-      headers: userHeaders(provider, auth),
-      signal: withTimeout(CHECKIN_TIMEOUT),
-    });
-  } catch (e) {
-    return { outcome: "failed", message: `AgentRouter：${e?.message ?? String(e)}` };
+  if (r.checkedIn) {
+    return { outcome: "claimed", message: "AgentRouter：已通过登录完成签到，新增额度已到账" };
   }
-  const { json, text } = await jsonOrText(res);
-  const msg = String(json?.message ?? json?.msg ?? "");
-
-  // A token the site refuses: nothing retries into a valid one, so this is
-  // the account's to fix. It is not a failed day, and magpie asking again
-  // every 30 minutes only fills the log.
-  if (res.status === 401 || /access\s*token.*(无效|invalid)|未登录且未提供/i.test(msg)) {
-    return {
-      outcome: "ineligible",
-      message: "AgentRouter：访问令牌无效或已失效，请到「个人设置 → 访问令牌」重新生成后填写",
-      signIn: "expired",
-    };
-  }
-  if (!json) {
-    return { outcome: "failed", message: `AgentRouter 返回 ${res.status}: ${String(text).slice(0, 120)}` };
-  }
-
-  if (json.success) {
-    // New API puts the day's credit in data, often as the amount added.
-    const credit = Number(json.data?.quota ?? json.data?.credit ?? json.data ?? NaN);
-    const streak = Number(json.data?.streak ?? NaN);
-    return {
-      outcome: "claimed",
-      ...(Number.isFinite(credit) ? { credit } : {}),
-      ...(Number.isFinite(streak) ? { streak } : {}),
-      message: msg || "AgentRouter：签到成功",
-    };
-  }
-
-  // The site's ways of saying "you already have today's", and its ways of
-  // saying there is nothing to claim now. Matching the words is what keeps
-  // a day from being retried every 30 minutes.
-  const already = /已经签到|已签到|今日已签|今天已签|already\s*(checked|signed)|already\s*claimed/i;
-  const inactive = /未开始|未到|尚未开始|not\s*(yet\s*)?(start|open)|no\s*(check-?in|activity)/i;
-  if (already.test(msg)) return { outcome: "done", message: msg };
-  if (inactive.test(msg)) return { outcome: "inactive", message: msg };
-
-  // A captcha the site wants is never solved here.
-  if (/turnstile|captcha|验证码/i.test(msg)) {
-    return { outcome: "captcha", message: msg || "AgentRouter 要求验证码" };
-  }
-
-  // "权限不足" is the site saying this account may not check in at all — its
-  // check-in isn't open to this group, or the route is closed. Retrying can't
-  // change it, so it settles for the day instead of failing every 30 minutes.
-  if (/权限不足|无权限|forbidden|permission\s*denied|not\s*allowed/i.test(msg)) {
-    return {
-      outcome: "ineligible",
-      message: `AgentRouter：该账号不允许签到（站点返回「${msg}」），不是失败，无需重试`,
-    };
-  }
-
-  return { outcome: "failed", message: msg || `AgentRouter 返回 ${res.status}` };
+  return { outcome: "done", message: "AgentRouter：今日额度已发放（登录时由站点自动完成）" };
 }
 
 // modelsOf asks the vendor for the models this account has. It is the same
@@ -448,7 +661,8 @@ export const AgentRouterAuthPlugin = async () => ({
     provider: PROVIDER,
 
     // Both credentials, because the vendor splits them: the key makes the
-    // requests, the access token claims the day and reads the balance.
+    // requests, and the site account signs in to claim the day and read the
+    // balance.
     methods: [
       {
         type: "api",
@@ -464,7 +678,7 @@ export const AgentRouterAuthPlugin = async () => ({
           {
             type: "select",
             key: "site",
-            message: "签到站点",
+            message: "站点（签到与余额走这里）",
             options: [
               { label: "agentrouter.org", value: "org" },
               { label: "ps.air-outer.com（备用域名）", value: "air" },
@@ -472,9 +686,27 @@ export const AgentRouterAuthPlugin = async () => ({
           },
           {
             type: "text",
+            key: "username",
+            message: "站点用户名或邮箱（签到＝登录一次，需要账号密码）",
+            placeholder: "留空则不签到，对话仍可用",
+          },
+          {
+            type: "text",
+            key: "password",
+            message: "站点密码（只存在本机，用于登录签到与读取余额）",
+            placeholder: "用 GitHub 登录的账号请先在站点设置密码",
+          },
+          {
+            type: "text",
+            key: "cookie",
+            message: "浏览器 Cookie（站点登录并滑过验证后，从开发者工具复制；用于读取余额）",
+            placeholder: "acw_sc__v2=…; session=…",
+          },
+          {
+            type: "text",
             key: "accessToken",
-            message: "访问令牌（站点「个人设置 → 访问令牌」，用于每日签到和余额）",
-            placeholder: "留空则跳过签到，对话仍可用",
+            message: "访问令牌（可选，站点「个人设置 → 访问令牌」；Cookie 有效时不需要）",
+            placeholder: "留空则用浏览器 Cookie 读取余额",
           },
           {
             type: "text",
@@ -495,6 +727,61 @@ export const AgentRouterAuthPlugin = async () => ({
         // the key (the host passes the key beside them, not inside them), so
         // a check written in it can only refuse a correct key. The key is
         // checked on the first request instead, where it actually goes.
+      },
+      {
+        // Signing in the way the site's own "Login with GitHub" button does.
+        //
+        // It is the one sign-in that yields everything at once: the site
+        // answers the callback with the user record, whose `access_token` is
+        // the credential the /api/user routes take and whose `quota` is the
+        // balance — and it grants the day's credit on the way, which is what
+        // the site calls its check-in. So an account signed in this way needs
+        // nothing typed in afterwards.
+        //
+        // The GitHub app is the site's, so its callback is the site's own
+        // page and the code lands in the browser's address bar rather than at
+        // a server this plugin runs. That is why the code is asked for: the
+        // user pastes the address the browser ended on, and the code is read
+        // out of it.
+        type: "oauth",
+        label: "用 GitHub 登录 AgentRouter（推荐）",
+        authorize: async (inputs) => {
+          const site = siteOf(String(inputs?.site ?? "org"));
+          const st = await oauthState(site.site);
+          if (!st.ok) throw new Error(st.why);
+          const cid = await githubClientId(site.site);
+          if (!cid.ok) throw new Error(cid.why);
+          const url =
+            "https://github.com/login/oauth/authorize" +
+            `?client_id=${encodeURIComponent(cid.id)}` +
+            `&state=${encodeURIComponent(st.state)}` +
+            "&scope=user:email";
+          return {
+            url,
+            instructions:
+              "在打开的页面用 GitHub 登录并授权。授权后浏览器会跳到 agentrouter.org 的地址，" +
+              "把那一整条地址（含 code=…）复制下来，回到这里粘贴。",
+            method: "code",
+            // The code is read from whatever the user pastes: the whole
+            // callback URL, or just the code.
+            callback: async (pasted) => {
+              const code = codeOf(pasted);
+              if (!code) return { type: "failed", error: "没有在粘贴的内容里找到 code" };
+              return redeemGithub(site.site, code, st.state, inputs);
+            },
+          };
+        },
+        prompts: [
+          {
+            type: "select",
+            key: "site",
+            message: "站点",
+            options: [
+              { label: "agentrouter.org", value: "org" },
+              { label: "ps.air-outer.com（备用域名）", value: "air" },
+            ],
+          },
+        ],
       },
     ],
 
@@ -553,6 +840,8 @@ export const _internal = {
   SITES,
   DEFAULT_HEADERS,
   parseHeaders,
+  parseCookies,
+  codeOf,
   headersOf,
   applyHeaders,
   apiBase,
