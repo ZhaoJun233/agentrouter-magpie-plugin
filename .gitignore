@@ -1,0 +1,19 @@
+# 依赖与构建产物
+node_modules/
+*.tgz
+
+# 本地凭据 —— 绝不提交
+plugin-auth.json
+.credentials*
+.env
+.env.*
+*.key
+*.pem
+
+# 抓包与临时文件
+*.json.bak
+r.json
+c.json
+*.log
+.DS_Store
+Thumbs.db
