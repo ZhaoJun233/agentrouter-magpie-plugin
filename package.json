@@ -1,7 +1,7 @@
 {
   "name": "opencode-agentrouter-auth",
   "version": "0.1.0",
-  "description": "AgentRouter (agentrouter.org) provider for magpie and OpenCode: API-key sign-in, configurable request headers, balance and the daily check-in",
+  "description": "AgentRouter (agentrouter.org) provider for magpie and OpenCode: GitHub or API-key sign-in, configurable request headers, balance and the daily check-in",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
@@ -14,6 +14,7 @@
     "opencode",
     "opencode-plugin",
     "magpie",
+    "magpie-plugin",
     "agentrouter",
     "llm-gateway"
   ],
