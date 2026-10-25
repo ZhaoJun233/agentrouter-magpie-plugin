@@ -208,47 +208,66 @@ async function jsonOrText(res) {
 // balance asks the site for the account's quota. New API answers
 // /api/user/self with the user record, whose quota and used_quota are in
 // the site's own units (1/500000 of a dollar on most deployments).
+//
+// It answers {ok, balance?, why?, expired?} rather than undefined, because
+// the reasons differ and only one of them is the user's to fix: a token the
+// site refuses needs a new one from the profile page, while a site that is
+// down is nothing to do with the account.
 async function balance(provider, auth) {
-  if (!userToken(auth)) return undefined;
+  if (!userToken(auth)) return { ok: false, why: "no-token" };
   try {
     const res = await fetch(`${siteBase(provider, auth)}/api/user/self`, {
       headers: userHeaders(provider, auth),
       signal: withTimeout(REQUEST_TIMEOUT),
     });
-    const { json } = await jsonOrText(res);
-    if (!res.ok || !json?.success) return undefined;
+    const { json, text } = await jsonOrText(res);
+    // New API answers 200 with success:false for a token it refuses, so the
+    // status alone doesn't say; the body does.
+    if (json && json.success === false) {
+      const msg = String(json.message ?? "");
+      if (/access\s*token|token.*(无效|invalid)|未登录/i.test(msg)) return { ok: false, why: "expired", expired: true };
+      return { ok: false, why: msg || "refused" };
+    }
+    if (!res.ok) return { ok: false, why: `HTTP ${res.status}` };
+    if (!json) return { ok: false, why: String(text).slice(0, 80) };
     const d = json.data ?? {};
     const quota = Number(d.quota ?? 0);
     const used = Number(d.used_quota ?? 0);
-    if (!Number.isFinite(quota) && !Number.isFinite(used)) return undefined;
-    return { quota, used, total: quota + used, name: d.username ?? d.display_name ?? "" };
-  } catch {
-    return undefined;
+    if (!Number.isFinite(quota) && !Number.isFinite(used)) return { ok: false, why: "no-quota" };
+    return { ok: true, balance: { quota, used, total: quota + used, name: d.username ?? d.display_name ?? "" } };
+  } catch (e) {
+    return { ok: false, why: `unreachable: ${e?.message ?? String(e)}` };
   }
 }
 
 // usageOf reports the account's balance to magpie. A New API site has no
 // plan windows: what it has is a credit balance, so it is reported as one.
+// When it can't be read the error says which of the reasons it was, since
+// the user can only fix one of them.
 async function usageOf(getAuth, provider) {
   const auth = await getAuth();
   if (!auth) return { windows: [] };
   const b = await balance(provider, auth);
-  if (!b) {
-    return {
-      error: userToken(auth)
-        ? "AgentRouter：无法读取余额"
-        : "AgentRouter：请填写站点访问令牌后再读取余额",
-      windows: [],
-    };
+  if (!b.ok) {
+    const why =
+      b.why === "no-token"
+        ? "AgentRouter：未填写站点「访问令牌」，无法读取余额（个人设置 → 访问令牌）"
+        : b.expired
+          ? "AgentRouter：访问令牌已失效，请到站点「个人设置 → 访问令牌」重新生成并填写"
+          : b.why === "no-quota"
+            ? "AgentRouter：站点没有返回额度字段"
+            : `AgentRouter：无法读取余额（${b.why}）`;
+    return { error: why, windows: [] };
   }
+  const bal = b.balance;
   // The site counts in 1/500000 dollars unless it says otherwise.
   const rate = Number(provider?.quotaPerUnit ?? 500000) || 500000;
   const dollars = (n) => Math.round((n / rate) * 100) / 100;
   return {
-    plan: b.name || undefined,
-    balance: dollars(b.quota),
+    plan: bal.name || undefined,
+    balance: dollars(bal.quota),
     windows: [
-      { name: "Balance", used: dollars(b.used), limit: dollars(b.total), remaining: dollars(b.quota) },
+      { name: "Balance", used: dollars(bal.used), limit: dollars(bal.total), remaining: dollars(bal.quota) },
     ],
   };
 }
@@ -278,16 +297,21 @@ async function checkinOf(getAuth, provider) {
     return { outcome: "failed", message: `AgentRouter：${e?.message ?? String(e)}` };
   }
   const { json, text } = await jsonOrText(res);
+  const msg = String(json?.message ?? json?.msg ?? "");
 
-  // A 401 means the access token is refused, not that the day failed: the
-  // user has to sign in again, and retrying all day changes nothing.
-  if (res.status === 401) {
-    return { outcome: "failed", message: "AgentRouter：访问令牌被拒绝，请重新登录", signIn: "expired" };
+  // A token the site refuses: nothing retries into a valid one, so this is
+  // the account's to fix. It is not a failed day, and magpie asking again
+  // every 30 minutes only fills the log.
+  if (res.status === 401 || /access\s*token.*(无效|invalid)|未登录且未提供/i.test(msg)) {
+    return {
+      outcome: "ineligible",
+      message: "AgentRouter：访问令牌无效或已失效，请到「个人设置 → 访问令牌」重新生成后填写",
+      signIn: "expired",
+    };
   }
   if (!json) {
-    return { outcome: "failed", message: `AgentRouter answered ${res.status}: ${String(text).slice(0, 120)}` };
+    return { outcome: "failed", message: `AgentRouter 返回 ${res.status}: ${String(text).slice(0, 120)}` };
   }
-  const msg = String(json.message ?? json.msg ?? "");
 
   if (json.success) {
     // New API puts the day's credit in data, often as the amount added.
@@ -311,8 +335,19 @@ async function checkinOf(getAuth, provider) {
 
   // A captcha the site wants is never solved here.
   if (/turnstile|captcha|验证码/i.test(msg)) {
-    return { outcome: "captcha", message: msg || "AgentRouter wants a captcha" };
+    return { outcome: "captcha", message: msg || "AgentRouter 要求验证码" };
   }
+
+  // "权限不足" is the site saying this account may not check in at all — its
+  // check-in isn't open to this group, or the route is closed. Retrying can't
+  // change it, so it settles for the day instead of failing every 30 minutes.
+  if (/权限不足|无权限|forbidden|permission\s*denied|not\s*allowed/i.test(msg)) {
+    return {
+      outcome: "ineligible",
+      message: `AgentRouter：该账号不允许签到（站点返回「${msg}」），不是失败，无需重试`,
+    };
+  }
+
   return { outcome: "failed", message: msg || `AgentRouter 返回 ${res.status}` };
 }
 
