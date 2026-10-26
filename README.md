@@ -89,6 +89,7 @@ AgentRouter 是 New API 站，它把两件事分给两种凭据：
 `sk-` key 打到 `/api/user/*` 一律返回 `access token 无效` —— 这是实测结论。所以 access token 是登录时的独立一项：**不填也能用**，只是余额和签到会说明原因，不会假装成功。
 
 > 注意：`/api/user/token` 是**重新生成**访问令牌的接口，不是读取。调它会让旧令牌立刻失效 —— 排查时踩过这个坑。
+> 插件只在 GitHub 登录那一次调它（站点兑换时不给令牌），换到的就是账号里存的那个，所以不影响别的账号。
 
 ## 协议：只有 Responses API
 
@@ -126,10 +127,16 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 2. 从 `/api/status` 读站点的 `github_client_id` 和 `server_address`，拼出 GitHub 授权 URL
 3. 你在打开的页面授权后，浏览器跳到 `agentrouter.org/oauth/github/magpie`（GitHub app 是站点的，回调也归站点）
 4. 把**那一整条地址**粘回插件，插件从里面取出 `code`
-5. `GET /api/oauth/github?code=…&state=…` 兑换登录态，拿到 `access_token` + `quota`
-6. 用 `access_token` 调 `/api/token/` 取出 `sk-` 密钥
+5. `GET /api/oauth/github?code=…&state=…` 兑换登录态，拿到用户记录（`id`、`quota`、`checked_in`）
+6. 站点**不在响应体里发访问令牌**（`data.access_token` 是 `null`），登录态由响应头的 `Set-Cookie: session=…` 承载；
+   插件取这条 session，调 `GET /api/user/token`（带 `New-Api-User`）换出一个访问令牌
+7. 用这个访问令牌调 `/api/token/` 取出密钥
 
 一次授权，三样齐全。
+
+> **为什么中间要多一步换令牌？** 站点把「登录」和「调用」拆成了两套凭据：兑换接口只种 `session` cookie，
+> 而 `/api/token/` 只认访问令牌。少了这一步，账号会以「站点没有返回访问令牌」失败 —— 这是实测的报错原文。
+> 顺带：`session` 也存进账号的 `metadata.cookie`，`/api/user/*` 的读取带上它更像真实浏览器。
 
 > **为什么回调要带 `/magpie` 这一段？** 站点自己的回调页 `/oauth/github` 是它单页应用里的一个路由，
 > 页面一加载就**立刻**把 `code` 兑换掉。等用户从地址栏复制出来，这个 `code` 已经被用过了，
