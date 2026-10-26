@@ -268,6 +268,24 @@ async function jsonOrText(res) {
 
 // ---- signing in with GitHub ---------------------------------------------------
 
+// The site's own callback page (/oauth/github) is a route in its single-page
+// app, and that route redeems the code the instant it loads — so by the time
+// the user has copied the address out of the browser, the code is already
+// spent and the exchange here fails with "code is incorrect or expired".
+//
+// A path *under* that one is not a route, so the app shows its "page not
+// found" screen and leaves the code alone, which is what this needs. GitHub
+// matches a callback against a subdirectory of the registered URL, and the
+// site's own token exchange does not send redirect_uri at all, so the URL
+// used here only has to survive the authorize step.
+const GITHUB_CALLBACK_PATH = "/oauth/github/magpie";
+
+// callbackUrl is where GitHub is asked to send the browser. It has to sit on
+// the origin the site's app registered — the site's own web routes, which the
+// site reports — because GitHub checks the callback's host, and the code is
+// checked against the site's app rather than against anything here.
+const callbackUrl = (origin) => `${origin}${GITHUB_CALLBACK_PATH}`;
+
 // oauthState asks the site for the state its GitHub sign-in expects. The site
 // issues it and later checks it on the callback, so it can't be made up here.
 async function oauthState(base) {
@@ -285,9 +303,13 @@ async function oauthState(base) {
   }
 }
 
-// githubClientId is the site's own GitHub app id, from the site's status: the
-// authorize page must be opened for the app whose callback the site owns.
-async function githubClientId(base) {
+// siteAuthConfig reads the facts the authorize URL needs out of the site's own
+// status: the GitHub app whose callback the site owns, and the origin that
+// callback lives on. The origin is not simply the front door the user picked —
+// the vendor runs two (org and air) for the same accounts, and GitHub matches
+// the callback against the app's registered host, which only the site's own
+// `server_address` names.
+async function siteAuthConfig(base) {
   try {
     const res = await fetch(`${base}/api/status`, {
       headers: DEFAULT_HEADERS,
@@ -296,7 +318,8 @@ async function githubClientId(base) {
     const { json } = await jsonOrText(res);
     const id = String(json?.data?.github_client_id ?? "").trim();
     if (!id) return { ok: false, why: "站点没有开启 GitHub 登录" };
-    return { ok: true, id };
+    const reported = String(json?.data?.server_address ?? "").trim().replace(/\/+$/, "");
+    return { ok: true, id, origin: reported || base.replace(/\/+$/, "") };
   } catch (e) {
     return { ok: false, why: `读不到站点配置：${e?.message ?? String(e)}` };
   }
@@ -362,9 +385,14 @@ async function redeemGithub(base, code, state, inputs) {
   };
 }
 
-// keyOf reads the account's sk- key with the access token just obtained.
+// keyOf reads the account's key with the access token just obtained.
 // /api/token/ is a normal user route and answers JSON, so it works where
 // /api/user/self may be behind the WAF.
+//
+// The key is taken as the site stores it rather than required to start with
+// "sk-": New API keeps a key exactly as it was generated, and this site's own
+// list holds the bare 48 characters, which its /v1 routes accept on their own.
+// An empty entry is the only thing that means "no key".
 async function keyOf(base, token, id) {
   try {
     const res = await fetch(`${base}/api/token/?p=1&page_size=10`, {
@@ -375,8 +403,7 @@ async function keyOf(base, token, id) {
     const items = json?.data?.items;
     if (!Array.isArray(items)) return "";
     const live = items.find((x) => x && x.status === 1 && typeof x.key === "string") ?? items.find((x) => x && typeof x.key === "string");
-    const k = String(live?.key ?? "").trim();
-    return k.startsWith("sk-") ? k : "";
+    return String(live?.key ?? "").trim();
   } catch {
     return "";
   }
@@ -749,18 +776,20 @@ export const AgentRouterAuthPlugin = async () => ({
           const site = siteOf(String(inputs?.site ?? "org"));
           const st = await oauthState(site.site);
           if (!st.ok) throw new Error(st.why);
-          const cid = await githubClientId(site.site);
+          const cid = await siteAuthConfig(site.site);
           if (!cid.ok) throw new Error(cid.why);
           const url =
             "https://github.com/login/oauth/authorize" +
             `?client_id=${encodeURIComponent(cid.id)}` +
             `&state=${encodeURIComponent(st.state)}` +
-            "&scope=user:email";
+            "&scope=user:email" +
+            `&redirect_uri=${encodeURIComponent(callbackUrl(cid.origin))}`;
           return {
             url,
             instructions:
-              "在打开的页面用 GitHub 登录并授权。授权后浏览器会跳到 agentrouter.org 的地址，" +
-              "把那一整条地址（含 code=…）复制下来，回到这里粘贴。",
+              `在打开的页面用 GitHub 登录并授权。授权后浏览器会跳到 ${cid.origin} 下的一个地址，` +
+              "它显示的是「页面未找到」——这是正常的，那一页不会用掉你的授权码。" +
+              "请把地址栏里那一整条地址（含 code=…）复制下来，回到这里粘贴。",
             method: "code",
             // The code is read from whatever the user pastes: the whole
             // callback URL, or just the code.

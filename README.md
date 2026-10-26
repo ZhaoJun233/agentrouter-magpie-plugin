@@ -123,13 +123,24 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 插件的 `authorize` 会：
 
 1. `GET /api/oauth/state?mode=login` 拿站点签发的 state
-2. 从 `/api/status` 读站点的 `github_client_id`，拼出 GitHub 授权 URL
-3. 你在打开的页面授权后，浏览器跳到 `agentrouter.org` 的地址（GitHub app 是站点的，回调也归站点）
+2. 从 `/api/status` 读站点的 `github_client_id` 和 `server_address`，拼出 GitHub 授权 URL
+3. 你在打开的页面授权后，浏览器跳到 `agentrouter.org/oauth/github/magpie`（GitHub app 是站点的，回调也归站点）
 4. 把**那一整条地址**粘回插件，插件从里面取出 `code`
 5. `GET /api/oauth/github?code=…&state=…` 兑换登录态，拿到 `access_token` + `quota`
 6. 用 `access_token` 调 `/api/token/` 取出 `sk-` 密钥
 
 一次授权，三样齐全。
+
+> **为什么回调要带 `/magpie` 这一段？** 站点自己的回调页 `/oauth/github` 是它单页应用里的一个路由，
+> 页面一加载就**立刻**把 `code` 兑换掉。等用户从地址栏复制出来，这个 `code` 已经被用过了，
+> 再拿去兑换只会得到 `code is incorrect or expired`——这就是「code 出现时间很短、复制到也报错」的原因。
+>
+> `/oauth/github/magpie` 是它下面的一层，**不是**路由，所以站点显示「页面未找到」而不碰这个 `code`。
+> GitHub 允许回调是注册地址的子目录（见 [授权 OAuth 应用](https://docs.github.com/zh/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps)），
+> 且站点自己兑换 token 时根本不传 `redirect_uri`（见其 `oauth/github.go` 的 `ExchangeToken`），
+> 所以这个地址只需在授权那一步通过即可。
+>
+> 因此跳过去看到「页面未找到」是**正常现象**，照常复制地址栏即可；真正让 code 失效的是站点那个会自兑换的回调页。
 
 ## 改请求头（不用重新登录）
 
