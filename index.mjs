@@ -344,17 +344,60 @@ function codeOf(pasted) {
   return "";
 }
 
+// sessionOf pulls the site's session cookie out of a response. This site
+// answers a sign-in by setting `session` rather than by putting a token in
+// the body, and `get("set-cookie")` joins every cookie with ", " — a
+// character that also appears inside one (an Expires date) — so the separate
+// entries are what get read when the runtime offers them.
+function sessionOf(res) {
+  let lines = [];
+  try {
+    if (typeof res.headers.getSetCookie === "function") lines = res.headers.getSetCookie() ?? [];
+  } catch {
+    lines = [];
+  }
+  if (!lines.length) {
+    const joined = res.headers.get("set-cookie");
+    if (joined) lines = [joined];
+  }
+  for (const line of lines) {
+    const m = /(?:^|[;,])\s*session=([^;,\s]+)/.exec(String(line));
+    if (m) return m[1];
+  }
+  return "";
+}
+
+// tokenForSession mints the access token the /api/user routes take. The
+// sign-in itself answers with a session and no token, which is what the
+// site's own front end does next: with the session it asks for one. New API
+// answers 401 to a session that doesn't say which user it is, so the id goes
+// along.
+async function tokenForSession(base, session, id) {
+  const headers = { ...DEFAULT_HEADERS, Cookie: `session=${session}` };
+  if (String(id ?? "") !== "") headers["New-Api-User"] = String(id);
+  try {
+    const res = await fetch(`${base}/api/user/token`, { headers, signal: withTimeout(REQUEST_TIMEOUT) });
+    const { json } = await jsonOrText(res);
+    return String(json?.data ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
 // redeemGithub trades the code for the site's sign-in. The answer is the user
-// record: `access_token` is what the /api/user routes take, `quota` is the
-// balance, and `checked_in` says whether this sign-in granted the day's
-// credit. The account keeps all of it, so nothing else has to be typed in.
+// record: `quota` is the balance and `checked_in` says whether this sign-in
+// granted the day's credit, and the same response carries the session the
+// /api/user routes take. The account keeps all of it, so nothing else has to
+// be typed in.
 async function redeemGithub(base, code, state, inputs) {
   let json;
+  let session = "";
   try {
     const res = await fetch(
       `${base}/api/oauth/github?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}&mode=login`,
       { headers: DEFAULT_HEADERS, signal: withTimeout(REQUEST_TIMEOUT) },
     );
+    session = sessionOf(res);
     ({ json } = await jsonOrText(res));
   } catch (e) {
     return { type: "failed", error: `兑换授权失败：${e?.message ?? String(e)}` };
@@ -363,24 +406,31 @@ async function redeemGithub(base, code, state, inputs) {
     return { type: "failed", error: String(json?.message ?? "GitHub 授权失败") };
   }
   const d = json.data ?? {};
-  const token = String(d.access_token ?? "").trim();
   const id = d.id ?? "";
+  // A token in the body is taken when the site sends one; this site sends
+  // `null` there and a session cookie instead, so the token is minted from
+  // the session. Without either the account can't read anything.
+  let token = String(d.access_token ?? "").trim();
+  if (!token && session) token = await tokenForSession(base, session, id);
   if (!token) return { type: "failed", error: "站点没有返回访问令牌" };
 
-  // The completions key is not in this answer, so it is read with the token
-  // that is: the account's own key list. A site that refuses leaves the key
+  // The completions key is not in this answer either, so it is read with the
+  // token: the account's own key list. A site that refuses leaves the key
   // empty, and the account then reads as signed in but unable to chat, which
   // its row says.
   const key = await keyOf(base, token, id);
   return {
     type: "success",
     // magpie saves this as an API sign-in: the key for completions, the
-    // access token beside it for the balance and the check-in.
+    // access token beside it for the balance and the check-in, and the
+    // browser session the site itself set, which is what gets a /api/user
+    // read past the WAF.
     key: key ?? "",
     metadata: {
       accessToken: token,
       userId: String(id ?? ""),
       site: String(inputs?.site ?? "org"),
+      ...(session ? { cookie: `session=${session}` } : {}),
     },
   };
 }
