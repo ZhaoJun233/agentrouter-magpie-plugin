@@ -4,6 +4,9 @@
   "description": "AgentRouter (agentrouter.org) provider for magpie and OpenCode: GitHub or API-key sign-in, configurable request headers, balance and the daily check-in",
   "type": "module",
   "main": "./index.mjs",
+  "scripts": {
+    "test": "node --test usage.test.mjs"
+  },
   "exports": "./index.mjs",
   "files": [
     "index.mjs",

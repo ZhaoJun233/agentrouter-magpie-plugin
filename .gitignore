@@ -1,5 +1,6 @@
 # 依赖与构建产物
 node_modules/
+.codegraph/
 *.tgz
 
 # 本地凭据 —— 绝不提交
@@ -11,6 +12,8 @@ plugin-auth.json
 *.pem
 
 # 抓包与临时文件
+verify-live.mjs
+*.bak-*
 *.json.bak
 r.json
 c.json

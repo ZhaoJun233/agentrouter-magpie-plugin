@@ -18,23 +18,22 @@
 //    credit is granted at sign-in instead (the site's login response
 //    carries checked_in, and its settings keep DailyCheckinQuota), so
 //    there is nothing for a plugin to claim after the fact. The check-in
-//    hook therefore reports "no check-in here" rather than a day's
-//    result, and never retries.
+//    hook signs in with the site's username and password when supplied.
 //
-// 3. Its balance is behind a WAF. /api/user/self is the only route that
-//    carries the account's quota, and from a server the site answers it
-//    with an Aliyun slider-captcha page instead of JSON. The slider is
-//    solved by a person in a browser, so the balance read fails with a
-//    reason that says so, and works again once the site lets the address
-//    through. The routes that do answer without a captcha carry no
-//    account balance: /api/token/ is one API key's own quota (negative
-//    when the key is unlimited), /v1/dashboard/billing/usage is that
-//    key's spend, and /api/log/self is a ledger. None of them is the
-//    account's balance, so none of them is used as one.
+// 3. /api/user/self reports quota and used_quota, but often returns an
+//    Aliyun slider-captcha page instead. Try it with an access token or
+//    browser session; neither credential guarantees passage through WAF.
+//    A password sign-in can also return the current user record and grant
+//    the day's credit. GitHub accounts may have no site password.
 //
-// Signing in with only the key is allowed and gives a working provider.
-// The access token is only for the balance read; without it that read
-// says which page to copy it from.
+//    Without a password, what is left is the spend: /api/log/self/stat
+//    answers a session or an access token with the account's used quota,
+//    and /v1/dashboard/billing/usage answers the key with the same figure
+//    in cents. Neither carries the credit, so those accounts report what
+//    they spent rather than a balance — an invented one would be worse.
+//
+// Signing in with only the key is allowed. It can read consumption, but
+// cannot determine remaining credit or perform password check-in.
 
 const PROVIDER = "agentrouter";
 
@@ -189,12 +188,8 @@ function headersText(auth) {
 }
 
 // cookieText is the browser cookie the account copied from the site.
-//
-// It is what gets past the WAF: /api/user/self answers a server with an
-// Aliyun slider captcha, and the cookie a browser holds after a person has
-// slid it is the proof the WAF wants. A password sign-in does not produce
-// one — the WAF challenge is per address, not per account — so the cookie is
-// the only credential that carries a real browser's clearance.
+// A valid session authenticates user reads. WAF can still challenge those
+// reads even when the same Cookie works in a browser.
 function cookieText(auth) {
   return String(meta(auth, "cookie") ?? "").trim();
 }
@@ -367,28 +362,11 @@ function sessionOf(res) {
   return "";
 }
 
-// tokenForSession mints the access token the /api/user routes take. The
-// sign-in itself answers with a session and no token, which is what the
-// site's own front end does next: with the session it asks for one. New API
-// answers 401 to a session that doesn't say which user it is, so the id goes
-// along.
-async function tokenForSession(base, session, id) {
-  const headers = { ...DEFAULT_HEADERS, Cookie: `session=${session}` };
-  if (String(id ?? "") !== "") headers["New-Api-User"] = String(id);
-  try {
-    const res = await fetch(`${base}/api/user/token`, { headers, signal: withTimeout(REQUEST_TIMEOUT) });
-    const { json } = await jsonOrText(res);
-    return String(json?.data ?? "").trim();
-  } catch {
-    return "";
-  }
-}
-
 // redeemGithub trades the code for the site's sign-in. The answer is the user
 // record: `quota` is the balance and `checked_in` says whether this sign-in
 // granted the day's credit, and the same response carries the session the
-// /api/user routes take. The account keeps all of it, so nothing else has to
-// be typed in.
+// /api/user routes take. The account keeps this session alongside the
+// system access token explicitly entered before authorization.
 async function redeemGithub(base, code, state, inputs) {
   let json;
   let session = "";
@@ -407,12 +385,10 @@ async function redeemGithub(base, code, state, inputs) {
   }
   const d = json.data ?? {};
   const id = d.id ?? "";
-  // A token in the body is taken when the site sends one; this site sends
-  // `null` there and a session cookie instead, so the token is minted from
-  // the session. Without either the account can't read anything.
-  let token = String(d.access_token ?? "").trim();
-  if (!token && session) token = await tokenForSession(base, session, id);
-  if (!token) return { type: "failed", error: "站点没有返回访问令牌" };
+  // Keep the explicitly entered system token; regenerating it here would
+  // invalidate the token the user just supplied.
+  const token = String(inputs?.accessToken ?? "").trim();
+  if (!token) return { type: "failed", error: "请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌）" };
 
   // The completions key is not in this answer either, so it is read with the
   // token: the account's own key list. A site that refuses leaves the key
@@ -505,11 +481,11 @@ async function signIn(provider, auth) {
     return { ok: false, why: msg || "refused", message: msg };
   }
   const d = json.data ?? {};
-  const quota = Number(d.quota ?? NaN);
-  const used = Number(d.used_quota ?? NaN);
+  const quota = quotaNumber(d.quota);
+  const used = quotaNumber(d.used_quota);
   const balance =
-    Number.isFinite(quota) || Number.isFinite(used)
-      ? { quota: Number.isFinite(quota) ? quota : 0, used: Number.isFinite(used) ? used : 0 }
+    Number.isFinite(quota) && Number.isFinite(used)
+      ? { quota, used, name: d.username ?? d.display_name ?? "" }
       : undefined;
   if (balance) balance.total = balance.quota + balance.used;
   // `checked_in: true` means *this* sign-in granted the day's credit. A false
@@ -517,20 +493,14 @@ async function signIn(provider, auth) {
   return { ok: true, checkedIn: d.checked_in === true, balance, name: d.username ?? d.display_name ?? "" };
 }
 
-// balance asks the site for the account's quota, by signing in. It answers
-// {ok, balance?, why?, expired?, blocked?} rather than undefined, because
-// the reasons differ and only one of them is the user's to fix: a refused
-// password needs a new one, while a site behind a captcha is nothing to do
-// with the account.
-//
-// The token route is tried first when the account has an access token, since
-// it is the cheaper read and works on a site that doesn't wall it. On this
-// one it is walled, so the sign-in is what actually answers.
+// Try the read-only user endpoint first, then password sign-in. Preserve
+// the failure reason when neither returns a complete quota record.
 async function balance(provider, auth) {
   const viaToken = await balanceByToken(provider, auth);
   if (viaToken.ok) return viaToken;
   const viaLogin = await signIn(provider, auth);
-  if (viaLogin.ok) return { ok: true, balance: viaLogin.balance };
+  if (viaLogin.ok && viaLogin.balance) return { ok: true, balance: viaLogin.balance };
+  if (viaLogin.ok) return { ok: false, why: "no-quota" };
   // Report the reason the user can act on: a wrong password outranks a
   // captcha, and a missing password means the token route's failure is the
   // real one.
@@ -539,9 +509,9 @@ async function balance(provider, auth) {
   return viaToken;
 }
 
-// balanceByToken reads /api/user/self with the account's access token.
+// Read /api/user/self with either an access token or a browser session.
 async function balanceByToken(provider, auth) {
-  if (!userToken(auth)) return { ok: false, why: "no-token" };
+  if (!userToken(auth) && !parseCookies(cookieText(auth))) return { ok: false, why: "no-token" };
   try {
     const res = await fetch(`${siteBase(provider, auth)}/api/user/self`, {
       headers: userHeaders(provider, auth),
@@ -567,29 +537,83 @@ async function balanceByToken(provider, auth) {
       return { ok: false, why: String(text).slice(0, 80) };
     }
     const d = json.data ?? {};
-    const quota = Number(d.quota ?? 0);
-    const used = Number(d.used_quota ?? 0);
-    if (!Number.isFinite(quota) && !Number.isFinite(used)) return { ok: false, why: "no-quota" };
+    const quota = quotaNumber(d.quota);
+    const used = quotaNumber(d.used_quota);
+    if (!Number.isFinite(quota) || !Number.isFinite(used)) return { ok: false, why: "no-quota" };
     return { ok: true, balance: { quota, used, total: quota + used, name: d.username ?? d.display_name ?? "" } };
   } catch (e) {
     return { ok: false, why: `unreachable: ${e?.message ?? String(e)}` };
   }
 }
 
-// usageOf reports the account's balance to magpie. A New API site has no
-// plan windows: what it has is a credit balance, so it is reported as one.
-// When it can't be read the error says which of the reasons it was, since
-// the user can only fix one of them.
+// These endpoints report cumulative consumption, never remaining credit.
+async function spendOf(provider, auth) {
+  const rate = quotaRate(provider);
+  const reads = [];
+  if (userToken(auth) || parseCookies(cookieText(auth))) {
+    reads.push({
+      url: `${siteBase(provider, auth)}/api/log/self/stat`,
+      headers: userHeaders(provider, auth),
+      field: "quota",
+      divisor: rate,
+    });
+  }
+  if (apiKey(auth)) {
+    reads.push({
+      url: `${apiBase(provider, auth)}/dashboard/billing/usage`,
+      headers: { ...headersOf(provider, auth), Authorization: `Bearer ${apiKey(auth)}` },
+      field: "total_usage",
+      divisor: 100,
+    });
+  }
+  for (const read of reads) {
+    try {
+      const res = await fetch(read.url, { headers: read.headers, signal: withTimeout(REQUEST_TIMEOUT) });
+      const { json } = await jsonOrText(res);
+      if (!res.ok || !json || json.success === false) continue;
+      const value = (json.data ?? json)[read.field];
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) continue;
+      return { ok: true, spent: value / read.divisor };
+    } catch {
+      // A failed user read must not prevent the independent key fallback.
+    }
+  }
+  return { ok: false };
+}
+
+function quotaNumber(value) {
+  if (typeof value !== "number" && !(typeof value === "string" && value.trim())) return NaN;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function quotaRate(provider) {
+  const rate = Number(provider?.quotaPerUnit ?? 500000);
+  return Number.isFinite(rate) && rate > 0 ? rate : 500000;
+}
+
+// magpie cannot show a percent-free consumption window. Use its text status
+// for partial data so spend never becomes a balance or an invented 0% window.
 async function usageOf(getAuth, provider) {
   const auth = await getAuth();
   if (!auth) return { windows: [] };
   const b = await balance(provider, auth);
   if (!b.ok) {
+    const spend = await spendOf(provider, auth);
+    if (spend.ok) {
+      const reason = b.blocked
+        ? "余额接口被滑动验证码拦截"
+        : b.expired ? "站点拒绝了余额查询凭据，请核对用户名密码或访问令牌" : "余额接口未返回可用余额";
+      return {
+        error: `AgentRouter：累计消耗 $${spend.spent.toFixed(2)}；剩余额度未知（${reason}）。读取余额需有效的 Cookie/访问令牌和用户 ID，或站点用户名密码；Cookie 不能保证通过验证码`,
+        windows: [],
+      };
+    }
     const why =
       b.expired
-        ? "AgentRouter：站点拒绝了登录，请核对账号里的用户名和密码"
+        ? "AgentRouter：站点拒绝了凭据，请核对用户名密码、访问令牌或 Cookie 及用户 ID"
         : b.blocked
-          ? "AgentRouter：余额接口被站点的滑动验证码拦截（阿里云 WAF）。在浏览器登录站点、滑过验证后，把 Cookie 填进账号即可读取"
+          ? "AgentRouter：余额接口被滑动验证码拦截，剩余额度未知。Cookie 不能保证通过验证码；可尝试有效的站点用户名密码读取余额"
           : b.why === "no-token"
             ? "AgentRouter：账号里没有访问令牌，也没有浏览器 Cookie，无法读取余额（个人设置 → 访问令牌）"
             : b.why === "no-quota"
@@ -599,7 +623,7 @@ async function usageOf(getAuth, provider) {
   }
   const bal = b.balance;
   // The site counts in 1/500000 dollars unless it says otherwise.
-  const rate = Number(provider?.quotaPerUnit ?? 500000) || 500000;
+  const rate = quotaRate(provider);
   const dollars = (n) => Math.round((n / rate) * 100) / 100;
 
   // New API's fields, as the site's own dashboard labels them:
@@ -608,8 +632,8 @@ async function usageOf(getAuth, provider) {
   //   both       the credit the account was given
   // magpie's window wants Used and Remaining as *percent*, with the counts
   // beside them in Amount/Limit/Unit — putting the dollars into Used is what
-  // made a $326.70 balance read as "0% left" (2265.25 was taken for a
-  // percentage). So the percent is computed here and the dollars go where
+  // can make a positive balance read as "0% left" when a dollar count is
+  // taken for a percentage. The percent is computed here; dollars go where
   // magpie shows counts.
   const left = dollars(bal.quota);
   const spent = dollars(bal.used);
@@ -619,7 +643,7 @@ async function usageOf(getAuth, provider) {
 
   return {
     plan: bal.name || undefined,
-    balance: left,
+    balance: `$${left.toFixed(2)}`,
     windows: [
       {
         name: "Balance",
@@ -776,8 +800,8 @@ export const AgentRouterAuthPlugin = async () => ({
           {
             type: "text",
             key: "cookie",
-            message: "浏览器 Cookie（站点登录并滑过验证后，从开发者工具复制；用于读取余额）",
-            placeholder: "acw_sc__v2=…; session=…",
+            message: "浏览器 Cookie（可选，登录站点后复制请求中的 Cookie；需同时填用户 ID，仍可能被验证码拦截）",
+            placeholder: "session=…",
           },
           {
             type: "text",
@@ -788,7 +812,7 @@ export const AgentRouterAuthPlugin = async () => ({
           {
             type: "text",
             key: "userId",
-            message: "用户 ID（New-Api-User，仅当站点要求时填写）",
+            message: "用户 ID（New-Api-User；用 Cookie 或访问令牌读取账号数据时填写）",
             placeholder: "例如 1234",
           },
           {
@@ -808,12 +832,9 @@ export const AgentRouterAuthPlugin = async () => ({
       {
         // Signing in the way the site's own "Login with GitHub" button does.
         //
-        // It is the one sign-in that yields everything at once: the site
-        // answers the callback with the user record, whose `access_token` is
-        // the credential the /api/user routes take and whose `quota` is the
-        // balance — and it grants the day's credit on the way, which is what
-        // the site calls its check-in. So an account signed in this way needs
-        // nothing typed in afterwards.
+        // Ask for the site's system access token before authorization.
+        // GitHub supplies the user ID and session; the entered token is kept
+        // for account reads and is never regenerated by this flow.
         //
         // The GitHub app is the site's, so its callback is the site's own
         // page and the code lands in the browser's address bar rather than at
@@ -823,6 +844,9 @@ export const AgentRouterAuthPlugin = async () => ({
         type: "oauth",
         label: "用 GitHub 登录 AgentRouter（推荐）",
         authorize: async (inputs) => {
+          if (!String(inputs?.accessToken ?? "").trim()) {
+            throw new Error("请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌，不是 API 密钥或 GitHub Token）");
+          }
           const site = siteOf(String(inputs?.site ?? "org"));
           const st = await oauthState(site.site);
           if (!st.ok) throw new Error(st.why);
@@ -851,6 +875,12 @@ export const AgentRouterAuthPlugin = async () => ({
           };
         },
         prompts: [
+          {
+            type: "text",
+            key: "accessToken",
+            message: "系统访问令牌（必填，AgentRouter「个人设置 → 访问令牌」；不是 API 密钥或 GitHub Token）",
+            placeholder: "粘贴系统访问令牌，用于查询账号额度",
+          },
           {
             type: "select",
             key: "site",

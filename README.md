@@ -2,17 +2,16 @@
 
 给 magpie 接入 [agentrouter.org](https://agentrouter.org/)：模型、余额、签到，以及**可自定义请求头**。
 
-## 三种登录方式
+## 登录方式与需要填写的内容
 
-面板或 CLI 里 `magpie plugin login agentrouter` 会让你选：
-
-| 方式 | 需要什么 | 能做什么 |
+| 方式 | 需要什么 | 能读取什么 |
 |---|---|---|
-| **用 GitHub 登录**（推荐） | 什么都不用填 | 一次授权拿到 API 密钥 + 访问令牌 + 余额，并顺带完成当天签到 |
-| API 密钥 | `sk-…` | 只能对话；余额/签到要另填访问令牌 |
-| API 密钥 + 访问令牌 | 再加「个人设置 → 访问令牌」 | 对话 + 余额 + 签到 |
+| **用 GitHub 登录**（推荐） | 先填系统访问令牌，再浏览器授权并复制回调地址 | 保存手填令牌，自动获取 API 密钥、session Cookie 和用户 ID；余额读取仍可能被 WAF 拦截 |
+| API 密钥 | `sk-…` | 对话、模型列表、累计消耗；不能推算剩余额度 |
+| API 密钥 + Cookie 或访问令牌 | Cookie 填 `session=…` 等完整请求头内容，同时填用户 ID；或有效访问令牌 + 用户 ID | 尝试读取当前余额；被 WAF 拦截时降级到累计消耗 |
+| API 密钥 + 站点用户名密码 | 站点账号密码，GitHub 密码不能代替 | 登录签到，并尝试从登录响应读取当前余额 |
 
-**推荐用 GitHub 登录**：它和站点自己的「Login with GitHub」按钮走同一条路，是唯一一次性把所有东西都拿到的入口。
+API 密钥登录时，Cookie 和访问令牌任选其一即可。GitHub 登录需要先填写同一 AgentRouter 账号的系统访问令牌（「个人设置 → 访问令牌」），不能为空；不是 `sk-…` API 密钥，也不是 GitHub Token。Cookie 和用户 ID 由 GitHub 授权自动获取。访问令牌失效时可以继续尝试有效 Cookie；两者都不能保证通过滑动验证码。
 
 ## 签到：就是登录一次
 
@@ -36,29 +35,22 @@
 
 > 用 GitHub 登录的账号可能**没有站点密码**。要密码签到，先去站点「设置」里设一个密码。
 
-## 余额：为什么以前读不到
+## 余额与累计消耗
 
-账户余额只有一个来源：`/api/user/self` 的 `quota` / `used_quota`。而它被阿里云 WAF 挡着 —— 服务器直接请求会拿到一个**滑动验证码页**（HTTP 200，但内容是 HTML，带 `sceneId`），必须人工拖滑块。
+读取顺序：
 
-实测确认**不是 token 的问题**：不带凭据、带假 token、带真 token、换 UA、换 Cookie，返回的都是同一个验证码页。而同一时刻 `/api/status`、`/api/token/`、`/api/log/self` 全部正常 —— 说明是**按路径**的拦截。
+1. 有 Cookie 或访问令牌时，带用户 ID 请求 `GET /api/user/self`，读取 `quota`（剩余）和 `used_quota`（累计消耗）。
+2. 失败后，有站点用户名密码则 `POST /api/user/login`，尝试从登录响应读取同样的字段。
+3. 仍无余额时，尝试 `GET /api/log/self/stat`，读取账号累计消耗。
+4. 再失败则用 API 密钥请求 `/v1/dashboard/billing/usage`，将 `total_usage` 的美分换成美元。
 
-插件现在的读取顺序：
+只有前两条返回完整额度字段时才显示余额和使用比例。缺字段不会当成零。只读到消耗时，插件返回“累计消耗 $…；剩余额度未知”，不会把消耗计入余额，也不会生成虚假的 0% 使用条。
 
-1. 有访问令牌 → `GET /api/user/self`
-2. 被 WAF 拦 → 提示「余额接口被滑动验证码拦截」
-3. 有用户名密码 → 改用登录拿 `quota`（登录接口不被拦）
+magpie 可能在查询失败时保留上次成功的额度，并标记旧读取时间（`asOf`）。这种余额是历史数据，不能当成刚查到的实时余额；没有历史读数的账号会直接显示上述状态提示。
 
-WAF 会自己解除。解除后无需任何操作，下一次刷新就正常。
+`/api/user/self` 常返回 HTTP 200 的阿里云滑动验证码 HTML，偶尔放行。有效 Cookie 也可能被拦；复制浏览器 Cookie 后不保证服务器可以读取。插件不自动破解滑块。
 
-### 这几个接口**不是**账户余额，别用
-
-排查时验证过，都不行：
-
-| 接口 | 它给的其实是 |
-|---|---|
-| `/api/token/` | **单把 key** 自己的额度；`unlimited_quota: true` 时 `remain_quota` 甚至是负数 |
-| `/v1/dashboard/billing/usage` | **单把 key** 自己的消耗（`total_usage`），和账户余额无关 |
-| `/api/log/self` | 流水账，不是余额 |
+`/api/token/` 的 `remain_quota` 是单把令牌的限额，不是账号余额；无限令牌的该值可能为负。`/api/log/self/stat` 和 billing usage 只有消耗，不能用于推算余额。
 
 ## 为什么需要自定义请求头
 
@@ -77,19 +69,13 @@ AgentRouter 的网关只回应它认识的客户端。同一个 key：
 
 格式是「一行一个 `Name: value`」，空行和 `#` 开头跳过 —— 从浏览器 devtools 整段复制过来就能用。
 
-## 两个凭据，别混
+## 凭据用途
 
-AgentRouter 是 New API 站，它把两件事分给两种凭据：
+- API key `sk-…`：对话、模型列表、累计消耗。
+- session Cookie / access token + 用户 ID：账号数据读取；余额可能被 WAF 拦截。
+- 站点用户名密码：登录签到，并尝试读取余额。访问令牌不能密码签到。
 
-| 用途 | 凭据 | 来源 |
-|---|---|---|
-| 对话/模型列表 | API key `sk-…` | 站点「令牌」页 |
-| 余额 / 签到 | **access token** | 站点「个人设置 → 访问令牌」 |
-
-`sk-` key 打到 `/api/user/*` 一律返回 `access token 无效` —— 这是实测结论。所以 access token 是登录时的独立一项：**不填也能用**，只是余额和签到会说明原因，不会假装成功。
-
-> 注意：`/api/user/token` 是**重新生成**访问令牌的接口，不是读取。调它会让旧令牌立刻失效 —— 排查时踩过这个坑。
-> 插件只在 GitHub 登录那一次调它（站点兑换时不给令牌），换到的就是账号里存的那个，所以不影响别的账号。
+`sk-` key 不能代替账号访问令牌。`/api/user/token` 会重新生成访问令牌，使旧令牌失效；插件不调用此接口，GitHub 登录直接保存你填写的系统访问令牌。
 
 ## 协议：只有 Responses API
 
@@ -109,9 +95,9 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 2. 站点 —— `agentrouter.org` / `ps.air-outer.com`
 3. 用户名或邮箱 —— 可留空；填了才能密码签到
 4. 密码 —— 可留空；只存本机
-5. 浏览器 Cookie —— 可留空；WAF 拦余额时填
+5. 浏览器 Cookie —— 可留空；填完整 `session=…`，不能保证通过 WAF
 6. 访问令牌 —— 可留空
-7. 用户 ID —— 仅当站点要求时填
+7. 用户 ID —— Cookie 或访问令牌读取账号数据时填写 `New-Api-User` 的值
 8. 自定义请求头 —— 每行一个 `Name: value`，留空用默认
 9. **API 密钥**（`sk-…`）
 
@@ -128,15 +114,10 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 3. 你在打开的页面授权后，浏览器跳到 `agentrouter.org/oauth/github/magpie`（GitHub app 是站点的，回调也归站点）
 4. 把**那一整条地址**粘回插件，插件从里面取出 `code`
 5. `GET /api/oauth/github?code=…&state=…` 兑换登录态，拿到用户记录（`id`、`quota`、`checked_in`）
-6. 站点**不在响应体里发访问令牌**（`data.access_token` 是 `null`），登录态由响应头的 `Set-Cookie: session=…` 承载；
-   插件取这条 session，调 `GET /api/user/token`（带 `New-Api-User`）换出一个访问令牌
-7. 用这个访问令牌调 `/api/token/` 取出密钥
+6. 从响应头提取 `Set-Cookie: session=…`，保存登录前填写的系统访问令牌，不重新生成令牌
+7. 用填写的访问令牌及授权返回的用户 ID 调 `/api/token/` 取出密钥
 
-一次授权，三样齐全。
-
-> **为什么中间要多一步换令牌？** 站点把「登录」和「调用」拆成了两套凭据：兑换接口只种 `session` cookie，
-> 而 `/api/token/` 只认访问令牌。少了这一步，账号会以「站点没有返回访问令牌」失败 —— 这是实测的报错原文。
-> 顺带：`session` 也存进账号的 `metadata.cookie`，`/api/user/*` 的读取带上它更像真实浏览器。
+开始授权前必须先填系统访问令牌；留空会提示补填，不会发起 GitHub 授权。令牌应属于本次 GitHub 登录对应的 AgentRouter 账号。`session` 同时保存到 `metadata.cookie`，后续账号查询会带上它。
 
 > **为什么回调要带 `/magpie` 这一段？** 站点自己的回调页 `/oauth/github` 是它单页应用里的一个路由，
 > 页面一加载就**立刻**把 `code` 兑换掉。等用户从地址栏复制出来，这个 `code` 已经被用过了，
@@ -197,9 +178,9 @@ magpie plugin login agentrouter
       "site": "org",
       "username": "（密码签到时填）",
       "password": "（只存本机）",
-      "cookie": "（WAF 拦余额时填）",
-      "accessToken": "（读余额用）",
-      "userId": "（站点要求时填）",
+      "cookie": "session=…（可选，配合用户 ID）",
+      "accessToken": "（可选，配合用户 ID 读账号数据）",
+      "userId": "（Cookie/访问令牌读取时填）",
       "headers": "User-Agent: codex_cli_rs/0.101.0"
     }
   }
@@ -222,11 +203,12 @@ docker exec magpie magpie provider test agentrouter
 #   ✓ responses  3469 ms · gpt-6-astra
 
 docker exec magpie magpie quota | grep -i agentrouter
-#   agentrouter · github_207743 · API key …B8tn   subscription  Balance 87% ($326.70 / $2591.95)
+#   agentrouter · example-user · API key …XXXX   subscription  Balance 25% ($150.00 / $200.00)
+#   上述为虚构示例；实际输出也可能提示“累计消耗…；剩余额度未知”。
 ```
 
 `Balance` 里的百分比是 magpie 的 `Used` 字段（剩余 = 100 − 已用），金额在 `Amount` / `Limit`。
-**不要把美元金额塞进 `Used`** —— 那会把 $2265 当成 2265%，剩余被截成 0%。
+**不要把美元金额塞进 `Used`** —— 例如把 $250 当成 250%，会使剩余被截成 0%。
 
 ## 敏感词正则过滤（配套）
 
