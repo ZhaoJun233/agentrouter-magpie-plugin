@@ -13,6 +13,7 @@ plugin-auth.json
 
 # 抓包与临时文件
 verify-live.mjs
+verify-local.mjs
 *.bak-*
 *.json.bak
 r.json

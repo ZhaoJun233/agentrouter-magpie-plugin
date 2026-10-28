@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AgentRouterAuthPlugin } from './index.mjs';
+import { AgentRouterAuthPlugin, _internal } from './index.mjs';
 
 const plugin = await AgentRouterAuthPlugin();
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
+
+const apiMethod = (p) => p.auth.methods.find((m) => m.type === 'api');
+const prompt = (p, key) => apiMethod(p).prompts.find((x) => x.key === key);
 
 test('GitHub login requires a system access token before requesting authorization', async () => {
   const method = plugin.auth.methods.find((m) => m.type === 'oauth');
@@ -37,6 +40,75 @@ test('GitHub login saves the entered token and never regenerates it', async () =
     assert.equal(result.key, 'sk-example');
     assert.equal(calls.at(-1).headers.Authorization, 'entered-token');
     assert.ok(calls.every((call) => !call.url.includes('/api/user/token')));
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('A key pasted into the endpoint question is refused there and ignored at request time', async () => {
+  // The question is where the key used to go, so a key pasted into it is the
+  // mistake this guards: told to the user while they can still fix it, and
+  // never used to build a base even when it is already stored.
+  const validate = prompt(plugin, 'endpoint').validate;
+  assert.equal(validate(''), undefined);
+  assert.equal(validate('https://agentrouter.org'), undefined);
+  assert.match(validate('sk-example'), /不要在这里填/);
+
+  const { calls } = await readUsage(
+    { key: 'sk-example', metadata: { endpoint: 'sk-example' } },
+    [json({ total_usage: 0 })],
+  );
+  assert.equal(calls[0].url, 'https://agentrouter.org/v1/dashboard/billing/usage');
+});
+
+test('The Codex headers are sent unless the provider switch is turned off', async () => {
+  // On — and on a host too old to offer the switch — the gateway sees the
+  // client it admits. Off, the user's own headers are all that go.
+  const withSwitch = (on) => AgentRouterAuthPlugin({ magpie: { option: () => on } });
+  try {
+    assert.equal(_internal.headersOf({}, {})['User-Agent'], 'codex_cli_rs/0.101.0');
+
+    await withSwitch(false);
+    const off = _internal.headersOf({}, {});
+    assert.equal(off['User-Agent'], undefined);
+    assert.equal(off.Accept, 'application/json');
+    assert.equal(
+      _internal.headersOf({}, { metadata: { headers: 'User-Agent: mine' } })['User-Agent'],
+      'mine',
+    );
+
+    await withSwitch(true);
+    assert.equal(_internal.headersOf({}, {})['User-Agent'], 'codex_cli_rs/0.101.0');
+
+    // A host from before the switch hands over no reader at all.
+    await AgentRouterAuthPlugin();
+    assert.equal(_internal.headersOf({}, {})['User-Agent'], 'codex_cli_rs/0.101.0');
+  } finally {
+    await withSwitch(true);
+  }
+});
+
+test('A retired model is never advertised back, whichever path lists it', async () => {
+  // magpie's cached models.dev entry for this vendor still names models the
+  // site has retired. The plugin's own list is what it answers with when the
+  // vendor's list cannot be read, so those names cannot come back through it.
+  const retired = ['claude-opus-5', 'claude-opus-4-8', 'deepseek-v4-flash', 'glm-5.3'];
+  const declared = Object.keys(_internal.declaredModels());
+  assert.deepEqual(declared, ['gpt-5.6-sol', 'gpt-6-astra', 'gpt-6.1-sol']);
+  for (const id of retired) assert.ok(!declared.includes(id), `${id} must not be declared`);
+
+  // No account yet: the vendor's list cannot be asked, and the row keeps the
+  // plugin's list rather than the row's.
+  const row = { models: { 'claude-opus-5': { name: 'x' }, 'gpt-6-astra': { name: 'y' } } };
+  const listed = await plugin.provider.models(row);
+  for (const id of retired) assert.ok(!(id in listed), `${id} must not be listed`);
+
+  // The vendor refuses the list: same answer, not the row's.
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response('nope', { status: 500 });
+  try {
+    const fell = await plugin.provider.models(row, { auth: { key: 'sk-example' } });
+    assert.deepEqual(Object.keys(fell), declared);
   } finally {
     globalThis.fetch = original;
   }

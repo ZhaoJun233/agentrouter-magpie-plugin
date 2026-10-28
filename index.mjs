@@ -4,11 +4,13 @@
 // relay:
 //
 // 1. Its gateway only answers a client it recognises. A request whose
-//    User-Agent is curl's (or anything else off its list) is refused with
-//    "unauthorized client detected", even when the key is good. So the
-//    request headers are not cosmetic here: they are what gets the key
-//    through. They are configurable — per provider and per account — and
-//    the defaults are the ones the vendor's own clients send.
+//    User-Agent is curl's, or a browser's, or anything else off its list is
+//    refused with "unauthorized client detected", even when the key is good.
+//    So the request headers are not cosmetic here: they are what gets the key
+//    through, and the one that works is the vendor's own client's. They are
+//    configurable — per provider and per account — and the default is that
+//    client's. The provider's own switch turns that default off, for a user
+//    who would rather send exactly the headers they named.
 //
 // 2. It has no daily check-in to call. The site is a New API deployment,
 //    and most New API sites put one on GET /api/user/checkin. This one
@@ -65,6 +67,29 @@ const MODEL_SHAPE = {
   reasoning: true,
 };
 
+// The models this plugin itself ships, by the name to show them under. They
+// are what the row lists before the vendor's own list arrives — and what it
+// falls back to when that list cannot be read.
+//
+// magpie also keeps a models.dev catalog, and its cached entry for this
+// vendor still carries models the site has retired (see README, "模型列表从
+// 哪来"). Falling back to the row's current models would re-advertise them,
+// so the fallback is built from this table instead: a model shown here is one
+// this plugin vouches for.
+const DECLARED_MODELS = {
+  "gpt-5.6-sol": "GPT-5.6 Sol",
+  "gpt-6-astra": "GPT-6 Astra",
+  "gpt-6.1-sol": "GPT-6.1 Sol",
+};
+
+// codexHeaders is whether requests are sent as a Codex CLI's, as the
+// provider's own switch has it. The switch is the vendor's whitelist made
+// optional: off, only the headers the user gave are sent. It is read from the
+// host when the plugin loads (magpie hands the reader over as input.magpie),
+// and defaults to on — including on a host too old to have the switch, which
+// is why the option is checked for rather than assumed.
+let codexHeaders = () => true;
+
 const REQUEST_TIMEOUT = 30_000;
 const CHECKIN_TIMEOUT = 25_000;
 
@@ -110,9 +135,13 @@ function modelHeaders(provider) {
 // headersOf is what a request to the vendor is sent with, lowest to highest:
 // the defaults, the provider's own block (its models' headers, which the
 // editor keeps), and the account's own, each overriding the one before it.
+//
+// The Codex User-Agent is the switch's business; Accept is not a client
+// claim, so it stays whatever the switch says.
 function headersOf(provider, auth) {
   return {
-    ...DEFAULT_HEADERS,
+    ...(codexHeaders() ? { "User-Agent": DEFAULT_HEADERS["User-Agent"] } : {}),
+    Accept: DEFAULT_HEADERS.Accept,
     ...modelHeaders(provider),
     ...parseHeaders(provider?.headers),
     ...parseHeaders(headersText(auth)),
@@ -129,13 +158,27 @@ function applyHeaders(h, extra) {
   return h;
 }
 
+// isURLish says whether a value can be a base URL at all: an http(s) address.
+// The endpoint question is free text, so a key pasted into it — which is what
+// the account manager's first question invites, since it is where the key
+// used to go — lands in the same field as a real address does. Such a value
+// is not an endpoint however it was stored, and building a base out of it
+// sends every request to nothing at all, with no error to show for it.
+function isURLish(v) {
+  return /^https?:\/\/\S+$/i.test(String(v ?? "").trim());
+}
+
 // apiBase is the base completions go to. It follows the account's own
 // endpoint when it gave one, and otherwise the endpoint this plugin was built
 // for — never the check-in site, so picking ps.air-outer.com for the check-in
 // doesn't quietly move requests off agentrouter.org.
+//
+// A stored endpoint that isn't a URL is ignored rather than used: the
+// request then still goes to the vendor, which is what the account wanted
+// when it pasted a key there.
 function apiBase(provider, auth) {
   const said = String(meta(auth, "endpoint") ?? provider?.endpoint ?? "").trim();
-  if (said) return `${said.replace(/\/+$/, "")}/v1`;
+  if (isURLish(said)) return `${said.replace(/\/+$/, "")}/v1`;
   const base = String(meta(auth, "apiBase") ?? "").trim();
   if (base) return base.replace(/\/+$/, "");
   return `${ENDPOINT}/v1`;
@@ -700,10 +743,21 @@ async function checkinOf(getAuth, provider) {
   return { outcome: "done", message: "AgentRouter：今日额度已发放（登录时由站点自动完成）" };
 }
 
+// declaredModels is the models this plugin vouches for, in the shape magpie
+// wants: a fresh object each time, because magpie edits what it is given.
+function declaredModels() {
+  const out = {};
+  for (const [id, name] of Object.entries(DECLARED_MODELS)) out[id] = { ...MODEL_SHAPE, name };
+  return out;
+}
+
 // modelsOf asks the vendor for the models this account has. It is the same
 // list every agent sees, and the vendor keeps it current.
 async function modelsOf(provider, { auth } = {}) {
-  const fallback = provider?.models ?? {};
+  // The fallback is this plugin's own list, never the row's: the row may
+  // still carry models a cached models.dev catalog gave it, and handing those
+  // back would advertise models the site no longer serves.
+  const fallback = declaredModels();
   if (!auth) return fallback;
   const key = apiKey(auth);
   if (!key) return fallback;
@@ -736,218 +790,231 @@ async function modelsOf(provider, { auth } = {}) {
   }
 }
 
-export const AgentRouterAuthPlugin = async () => ({
-  // The provider before anyone signs in: the models the vendor serves, so the
-  // row has something to show, and the shape each listed one takes.
-  //
-  // The vendor's models answer the Responses API only: a chat-completions
-  // request is refused with "does not support /v1/chat/completions, please use
-  // /v1/responses", whatever the key. So the provider speaks Responses, and
-  // the gateway translates an agent's Chat or Anthropic request into it.
-  config: async (cfg) => {
-    cfg.provider ??= {};
-    cfg.provider[PROVIDER] ??= {
-      name: "AgentRouter",
-      npm: "@ai-sdk/openai",
-      api: `${ENDPOINT}/v1`,
-      models: {
-        "gpt-5.6-sol": { ...MODEL_SHAPE, name: "GPT-5.6 Sol" },
-        "gpt-6-astra": { ...MODEL_SHAPE, name: "GPT-6 Astra" },
-        "gpt-6.1-sol": { ...MODEL_SHAPE, name: "GPT-6.1 Sol" },
-      },
-    };
-  },
-
-  auth: {
-    provider: PROVIDER,
-
-    // Both credentials, because the vendor splits them: the key makes the
-    // requests, and the site account signs in to claim the day and read the
-    // balance.
-    methods: [
-      {
-        type: "api",
-        label: "AgentRouter API 密钥",
-        placeholder: "sk-…",
-        prompts: [
-          {
-            type: "text",
-            key: "endpoint",
-            message: "请求端点（对话与模型列表）",
-            placeholder: ENDPOINT,
-          },
-          {
-            type: "select",
-            key: "site",
-            message: "站点（签到与余额走这里）",
-            options: [
-              { label: "agentrouter.org", value: "org" },
-              { label: "ps.air-outer.com（备用域名）", value: "air" },
-            ],
-          },
-          {
-            type: "text",
-            key: "username",
-            message: "站点用户名或邮箱（签到＝登录一次，需要账号密码）",
-            placeholder: "留空则不签到，对话仍可用",
-          },
-          {
-            type: "text",
-            key: "password",
-            message: "站点密码（只存在本机，用于登录签到与读取余额）",
-            placeholder: "用 GitHub 登录的账号请先在站点设置密码",
-          },
-          {
-            type: "text",
-            key: "cookie",
-            message: "浏览器 Cookie（可选，登录站点后复制请求中的 Cookie；需同时填用户 ID，仍可能被验证码拦截）",
-            placeholder: "session=…",
-          },
-          {
-            type: "text",
-            key: "accessToken",
-            message: "访问令牌（可选，站点「个人设置 → 访问令牌」；Cookie 有效时不需要）",
-            placeholder: "留空则用浏览器 Cookie 读取余额",
-          },
-          {
-            type: "text",
-            key: "userId",
-            message: "用户 ID（New-Api-User；用 Cookie 或访问令牌读取账号数据时填写）",
-            placeholder: "例如 1234",
-          },
-          {
-            type: "text",
-            key: "headers",
-            message: "自定义请求头：每行一个「名称: 值」，留空则用默认的 Codex 客户端标识",
-            placeholder: "User-Agent: codex_cli_rs/0.101.0",
-          },
-        ],
-        // No `authorize`: the host saves the key itself, and the answers to
-        // the prompts become the account's metadata. That is deliberate —
-        // an `authorize` here would be handed the prompts' answers *without*
-        // the key (the host passes the key beside them, not inside them), so
-        // a check written in it can only refuse a correct key. The key is
-        // checked on the first request instead, where it actually goes.
-      },
-      {
-        // Signing in the way the site's own "Login with GitHub" button does.
-        //
-        // Ask for the site's system access token before authorization.
-        // GitHub supplies the user ID and session; the entered token is kept
-        // for account reads and is never regenerated by this flow.
-        //
-        // The GitHub app is the site's, so its callback is the site's own
-        // page and the code lands in the browser's address bar rather than at
-        // a server this plugin runs. That is why the code is asked for: the
-        // user pastes the address the browser ended on, and the code is read
-        // out of it.
-        type: "oauth",
-        label: "用 GitHub 登录 AgentRouter（推荐）",
-        authorize: async (inputs) => {
-          if (!String(inputs?.accessToken ?? "").trim()) {
-            throw new Error("请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌，不是 API 密钥或 GitHub Token）");
-          }
-          const site = siteOf(String(inputs?.site ?? "org"));
-          const st = await oauthState(site.site);
-          if (!st.ok) throw new Error(st.why);
-          const cid = await siteAuthConfig(site.site);
-          if (!cid.ok) throw new Error(cid.why);
-          const url =
-            "https://github.com/login/oauth/authorize" +
-            `?client_id=${encodeURIComponent(cid.id)}` +
-            `&state=${encodeURIComponent(st.state)}` +
-            "&scope=user:email" +
-            `&redirect_uri=${encodeURIComponent(callbackUrl(cid.origin))}`;
-          return {
-            url,
-            instructions:
-              `在打开的页面用 GitHub 登录并授权。授权后浏览器会跳到 ${cid.origin} 下的一个地址，` +
-              "它显示的是「页面未找到」——这是正常的，那一页不会用掉你的授权码。" +
-              "请把地址栏里那一整条地址（含 code=…）复制下来，回到这里粘贴。",
-            method: "code",
-            // The code is read from whatever the user pastes: the whole
-            // callback URL, or just the code.
-            callback: async (pasted) => {
-              const code = codeOf(pasted);
-              if (!code) return { type: "failed", error: "没有在粘贴的内容里找到 code" };
-              return redeemGithub(site.site, code, st.state, inputs);
-            },
-          };
-        },
-        prompts: [
-          {
-            type: "text",
-            key: "accessToken",
-            message: "系统访问令牌（必填，AgentRouter「个人设置 → 访问令牌」；不是 API 密钥或 GitHub Token）",
-            placeholder: "粘贴系统访问令牌，用于查询账号额度",
-          },
-          {
-            type: "select",
-            key: "site",
-            message: "站点",
-            options: [
-              { label: "agentrouter.org", value: "org" },
-              { label: "ps.air-outer.com（备用域名）", value: "air" },
-            ],
-          },
-        ],
-      },
-    ],
-
-    // The request each completion is sent as. Every model is an OpenAI
-    // chat-completions model here, so the body goes on as the gateway wrote
-    // it; only the headers are this plugin's business.
-    async loader(getAuth, provider) {
-      const auth = await getAuth();
-      if (!auth) return {};
-      const base = apiBase(provider, auth);
-      return {
-        baseURL: base,
-        apiKey: apiKey(auth) || "agentrouter",
-        async fetch(input, init = {}) {
-          const key = apiKey(auth);
-          const h = new Headers(input instanceof Request ? input.headers : undefined);
-          new Headers(init.headers ?? {}).forEach((v, k) => h.set(k, v));
-          applyHeaders(h, headersOf(provider, auth));
-          if (key) h.set("Authorization", `Bearer ${key}`);
-          return fetch(input, { ...init, headers: h });
-        },
+export const AgentRouterAuthPlugin = async (input) => {
+  // The host hands over its reader for the provider's switches; an older one
+  // has none, and the Codex headers stay on there (README, "为什么需要自定义
+  // 请求头"). Reading it through a closure keeps headersOf's own signature —
+  // provider and account — which every caller already passes.
+  codexHeaders = () => input?.magpie?.option?.(PROVIDER, "send-codex-headers") !== false;
+  return {
+    // The provider before anyone signs in: the models the vendor serves, so the
+    // row has something to show, and the shape each listed one takes.
+    //
+    // The vendor's models answer the Responses API only: a chat-completions
+    // request is refused with "does not support /v1/chat/completions, please use
+    // /v1/responses", whatever the key. So the provider speaks Responses, and
+    // the gateway translates an agent's Chat or Anthropic request into it.
+    config: async (cfg) => {
+      cfg.provider ??= {};
+      cfg.provider[PROVIDER] ??= {
+        name: "AgentRouter",
+        npm: "@ai-sdk/openai",
+        api: `${ENDPOINT}/v1`,
+        models: declaredModels(),
       };
     },
 
-    usage: usageOf,
-    checkin: checkinOf,
+    auth: {
+      provider: PROVIDER,
 
-    // Switches the user can turn on the provider's editor.
-    options: [
-      {
-        key: "send-codex-headers",
-        label: "Send the Codex client headers",
-        description:
-          "AgentRouter's gateway only answers clients it recognises. On, requests are sent as a Codex CLI's; off, only the headers you gave are sent.",
-        default: true,
+      // Both credentials, because the vendor splits them: the key makes the
+      // requests, and the site account signs in to claim the day and read the
+      // balance.
+      methods: [
+        {
+          type: "api",
+          label: "AgentRouter API 密钥",
+          placeholder: "sk-…",
+          prompts: [
+            {
+              type: "text",
+              key: "endpoint",
+              message: "请求端点（对话与模型列表）",
+              placeholder: ENDPOINT,
+              // The key is asked for separately, last. This question is here
+              // because the editor's box is where the key used to go: a key
+              // pasted into it becomes apiBase's endpoint and every request
+              // then goes nowhere, silently. So the answer is checked here,
+              // where the user can still be told.
+              validate: (v) =>
+                !String(v ?? "").trim() || isURLish(v)
+                  ? undefined
+                  : "请填站点地址，例如 https://agentrouter.org（不要在这里填 API 密钥）",
+            },
+            {
+              type: "select",
+              key: "site",
+              message: "站点（签到与余额走这里）",
+              options: [
+                { label: "agentrouter.org", value: "org" },
+                { label: "ps.air-outer.com（备用域名）", value: "air" },
+              ],
+            },
+            {
+              type: "text",
+              key: "username",
+              message: "站点用户名或邮箱（签到＝登录一次，需要账号密码）",
+              placeholder: "留空则不签到，对话仍可用",
+            },
+            {
+              type: "text",
+              key: "password",
+              message: "站点密码（只存在本机，用于登录签到与读取余额）",
+              placeholder: "用 GitHub 登录的账号请先在站点设置密码",
+            },
+            {
+              type: "text",
+              key: "cookie",
+              message: "浏览器 Cookie（可选，登录站点后复制请求中的 Cookie；需同时填用户 ID，仍可能被验证码拦截）",
+              placeholder: "session=…",
+            },
+            {
+              type: "text",
+              key: "accessToken",
+              message: "访问令牌（可选，站点「个人设置 → 访问令牌」；Cookie 有效时不需要）",
+              placeholder: "留空则用浏览器 Cookie 读取余额",
+            },
+            {
+              type: "text",
+              key: "userId",
+              message: "用户 ID（New-Api-User；用 Cookie 或访问令牌读取账号数据时填写）",
+              placeholder: "例如 1234",
+            },
+            {
+              type: "text",
+              key: "headers",
+              message: "自定义请求头：每行一个「名称: 值」，留空则用默认的 Codex 客户端标识",
+              placeholder: "User-Agent: codex_cli_rs/0.101.0",
+            },
+          ],
+          // No `authorize`: the host saves the key itself, and the answers to
+          // the prompts become the account's metadata. That is deliberate —
+          // an `authorize` here would be handed the prompts' answers *without*
+          // the key (the host passes the key beside them, not inside them), so
+          // a check written in it can only refuse a correct key. The key is
+          // checked on the first request instead, where it actually goes.
+        },
+        {
+          // Signing in the way the site's own "Login with GitHub" button does.
+          //
+          // Ask for the site's system access token before authorization.
+          // GitHub supplies the user ID and session; the entered token is kept
+          // for account reads and is never regenerated by this flow.
+          //
+          // The GitHub app is the site's, so its callback is the site's own
+          // page and the code lands in the browser's address bar rather than at
+          // a server this plugin runs. That is why the code is asked for: the
+          // user pastes the address the browser ended on, and the code is read
+          // out of it.
+          type: "oauth",
+          label: "用 GitHub 登录 AgentRouter（推荐）",
+          authorize: async (inputs) => {
+            if (!String(inputs?.accessToken ?? "").trim()) {
+              throw new Error("请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌，不是 API 密钥或 GitHub Token）");
+            }
+            const site = siteOf(String(inputs?.site ?? "org"));
+            const st = await oauthState(site.site);
+            if (!st.ok) throw new Error(st.why);
+            const cid = await siteAuthConfig(site.site);
+            if (!cid.ok) throw new Error(cid.why);
+            const url =
+              "https://github.com/login/oauth/authorize" +
+              `?client_id=${encodeURIComponent(cid.id)}` +
+              `&state=${encodeURIComponent(st.state)}` +
+              "&scope=user:email" +
+              `&redirect_uri=${encodeURIComponent(callbackUrl(cid.origin))}`;
+            return {
+              url,
+              instructions:
+                `在打开的页面用 GitHub 登录并授权。授权后浏览器会跳到 ${cid.origin} 下的一个地址，` +
+                "它显示的是「页面未找到」——这是正常的，那一页不会用掉你的授权码。" +
+                "请把地址栏里那一整条地址（含 code=…）复制下来，回到这里粘贴。",
+              method: "code",
+              // The code is read from whatever the user pastes: the whole
+              // callback URL, or just the code.
+              callback: async (pasted) => {
+                const code = codeOf(pasted);
+                if (!code) return { type: "failed", error: "没有在粘贴的内容里找到 code" };
+                return redeemGithub(site.site, code, st.state, inputs);
+              },
+            };
+          },
+          prompts: [
+            {
+              type: "text",
+              key: "accessToken",
+              message: "系统访问令牌（必填，AgentRouter「个人设置 → 访问令牌」；不是 API 密钥或 GitHub Token）",
+              placeholder: "粘贴系统访问令牌，用于查询账号额度",
+            },
+            {
+              type: "select",
+              key: "site",
+              message: "站点",
+              options: [
+                { label: "agentrouter.org", value: "org" },
+                { label: "ps.air-outer.com（备用域名）", value: "air" },
+              ],
+            },
+          ],
+        },
+      ],
+
+      // The request each completion is sent as. Every model is an OpenAI
+      // chat-completions model here, so the body goes on as the gateway wrote
+      // it; only the headers are this plugin's business.
+      async loader(getAuth, provider) {
+        const auth = await getAuth();
+        if (!auth) return {};
+        const base = apiBase(provider, auth);
+        return {
+          baseURL: base,
+          apiKey: apiKey(auth) || "agentrouter",
+          async fetch(input, init = {}) {
+            const key = apiKey(auth);
+            const h = new Headers(input instanceof Request ? input.headers : undefined);
+            new Headers(init.headers ?? {}).forEach((v, k) => h.set(k, v));
+            applyHeaders(h, headersOf(provider, auth));
+            if (key) h.set("Authorization", `Bearer ${key}`);
+            return fetch(input, { ...init, headers: h });
+          },
+        };
       },
-    ],
-  },
 
-  provider: {
-    id: PROVIDER,
-    models: modelsOf,
-  },
+      usage: usageOf,
+      checkin: checkinOf,
 
-  // A conversation's turns reach the vendor under one id, so its cache sees
-  // them as one conversation.
-  "chat.headers": async (input, output) => {
-    if (input?.model?.providerID !== PROVIDER && input?.provider?.info?.id !== PROVIDER) return;
-    if (input.sessionID) output.headers["x-session-id"] = input.sessionID;
-  },
-});
+      // Switches the user can turn on the provider's editor.
+      options: [
+        {
+          key: "send-codex-headers",
+          label: "Send the Codex client headers",
+          description:
+            "AgentRouter's gateway only answers clients it recognises. On, requests are sent as a Codex CLI's; off, only the headers you gave are sent.",
+          default: true,
+        },
+      ],
+    },
+
+    provider: {
+      id: PROVIDER,
+      models: modelsOf,
+    },
+
+    // A conversation's turns reach the vendor under one id, so its cache sees
+    // them as one conversation.
+    "chat.headers": async (input, output) => {
+      if (input?.model?.providerID !== PROVIDER && input?.provider?.info?.id !== PROVIDER) return;
+      if (input.sessionID) output.headers["x-session-id"] = input.sessionID;
+    },
+  };
+};
 
 export default AgentRouterAuthPlugin;
 export const _internal = {
   PROVIDER,
   SITES,
   DEFAULT_HEADERS,
+  DECLARED_MODELS,
   parseHeaders,
   parseCookies,
   codeOf,
@@ -957,4 +1024,6 @@ export const _internal = {
   siteBase,
   userHeaders,
   masked,
+  isURLish,
+  declaredModels,
 };

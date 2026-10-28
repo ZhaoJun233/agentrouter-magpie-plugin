@@ -8,7 +8,7 @@
 |---|---|---|
 | **用 GitHub 登录**（推荐） | 先填系统访问令牌，再浏览器授权并复制回调地址 | 保存手填令牌，自动获取 API 密钥、session Cookie 和用户 ID；余额读取仍可能被 WAF 拦截 |
 | API 密钥 | `sk-…` | 对话、模型列表、累计消耗；不能推算剩余额度 |
-| API 密钥 + Cookie 或访问令牌 | Cookie 填 `session=…` 等完整请求头内容，同时填用户 ID；或有效访问令牌 + 用户 ID | 尝试读取当前余额；被 WAF 拦截时降级到累计消耗 |
+| API 密钥 + Cookie 或访问令牌 | Cookie 只填 Cookie 的值（`session=…`，多个用 `; ` 连接），同时填用户 ID；或有效访问令牌 + 用户 ID | 尝试读取当前余额；被 WAF 拦截时降级到累计消耗 |
 | API 密钥 + 站点用户名密码 | 站点账号密码，GitHub 密码不能代替 | 登录签到，并尝试从登录响应读取当前余额 |
 
 API 密钥登录时，Cookie 和访问令牌任选其一即可。GitHub 登录需要先填写同一 AgentRouter 账号的系统访问令牌（「个人设置 → 访问令牌」），不能为空；不是 `sk-…` API 密钥，也不是 GitHub Token。Cookie 和用户 ID 由 GitHub 授权自动获取。访问令牌失效时可以继续尝试有效 Cookie；两者都不能保证通过滑动验证码。
@@ -54,20 +54,28 @@ magpie 可能在查询失败时保留上次成功的额度，并标记旧读取�
 
 ## 为什么需要自定义请求头
 
-AgentRouter 的网关只回应它认识的客户端。同一个 key：
+AgentRouter 的网关只回应它认识的客户端 —— 白名单里是它**自家客户端**的标识。同一个 key：
 
 | User-Agent | 结果 |
 |---|---|
 | `codex_cli_rs/0.101.0` | `200` |
+| 浏览器（Chrome / Mobile Safari 的完整 UA） | `401 unauthorized client detected` |
 | `curl/8.0` | `401 unauthorized client detected` |
 | 空（删掉） | `401` |
 
-所以请求头在这里不是装饰，是**决定成败**的东西。插件默认发 Codex CLI 的头，并且允许你在两处覆盖：
+**这条只管模型网关**（`/v1/models`、`/v1/responses`）。站点自己的路由（`/api/...`）不看这个头，浏览器 UA 也一样能用；反过来，`codex_cli_rs` 也不会帮忙过滑动验证码。
 
+所以请求头在这里不是装饰，是**决定成败**的东西。插件默认发 Codex CLI 的头，并且允许你在三处覆盖：
+
+- **开关**（provider 编辑器里的 `Send the Codex client headers`）：默认开。关掉后不再发默认的 Codex 标识，只发你自己给的头 —— 适合你已经有别的可用标识时。
 - **provider 级**：`providers.json` 里该 provider 的 `headers`
 - **账号级**：登录时填的 `headers`（覆盖 provider 级）
 
-格式是「一行一个 `Name: value`」，空行和 `#` 开头跳过 —— 从浏览器 devtools 整段复制过来就能用。
+格式是「一行一个 `Name: value`」，空行和 `#` 开头跳过。这里**只适合放这种头**：不要整段粘贴浏览器 devtools 的请求头 —— `Cookie` 有专门的一问，`Authorization` 由插件按 key/令牌设置，而 `User-Agent` 应该填**网关认的客户端标识**，不是浏览器的那一长串。
+
+> 踩坑记录：把 Mobile Safari 的完整 `User-Agent` 贴进 `headers` 后，`/v1` 一律 401
+> `unauthorized client detected`，而站点路由（余额、签到）却一切正常 —— 很容易以为是 key 或插件坏了。
+> 网关只认它自己的客户端标识，换回 `codex_cli_rs/0.101.0`（或清空、用默认）即恢复。
 
 ## 凭据用途
 
@@ -87,11 +95,39 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 
 所以 provider 声明为 `npm: "@ai-sdk/openai"`（Responses）。agent 发 Chat / Anthropic 请求时，由 magpie 网关负责翻译。
 
+## 模型列表从哪来
+
+面板里的模型来自**两个来源的并集**：
+
+1. **插件自己的名单**（本仓库 `index.mjs` 的 `DECLARED_MODELS`）：登录前展示用，也是读不到站点列表时的兜底。当前是 `gpt-5.6-sol` / `gpt-6-astra` / `gpt-6.1-sol`。
+2. **magpie 自带的 models.dev 目录**：`magpie` 会把目录里同名条目（`agentrouter`）的模型并进来。这个目录在服务器上是 `config/cache/magpie/models.json`，**由 magpie 自己同步，不由本插件控制**。
+
+两者取并集去重。因此如果站点下架了某个模型，而目录缓存里还留着，面板就会多列出已下架的模型 —— 选中它只会得到：
+
+```
+503 当前分组 default 下对于模型 xxx 无可用渠道
+```
+
+插件这边能保证的是：**站点自己的列表**（`GET /v1/models`，账号有效时）永远优先，读不到时才回落到插件名单，而**不会再回落到目录里那些名字**。所以正确的做法是让站点列表生效：
+
+```bash
+# 让 magpie 重新拉一次账号的模型列表
+docker exec magpie magpie providers        # 状态里会写 "N of M models · fetched …"
+docker exec magpie magpie provider models agentrouter
+```
+
+如果你的面板仍显示已下架的模型，那是目录缓存的贡献，不是插件声明的。可以：
+
+- 在 provider 编辑器里把不需要的模型关掉（`disabled`），它们在列表里就不再生效；
+- 或者清掉/更新 `config/cache/magpie/models.json` 里的 `agentrouter` 条目（升级 magpie 也会刷新目录）。
+
+> 站点给你几个模型，以 `GET /v1/models` 为准 —— 它和面板是两回事。
+
 ## 登录问答（API 密钥方式）
 
 面板或 CLI 的登录问答（**密钥最后单独问**）：
 
-1. 请求端点（对话与模型列表）—— 默认 `https://agentrouter.org`
+1. 请求端点（对话与模型列表）—— 可留空，默认 `https://agentrouter.org`；**这一问只填地址**，填了 `sk-…` 会被当场拒绝并提示
 2. 站点 —— `agentrouter.org` / `ps.air-outer.com`
 3. 用户名或邮箱 —— 可留空；填了才能密码签到
 4. 密码 —— 可留空；只存本机
@@ -100,6 +136,10 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 7. 用户 ID —— Cookie 或访问令牌读取账号数据时填写 `New-Api-User` 的值
 8. 自定义请求头 —— 每行一个 `Name: value`，留空用默认
 9. **API 密钥**（`sk-…`）
+
+> 第 1 问**只填地址**。旧版本的这一问容易让人把 `sk-…` 粘进去，那会让对话请求打到 `sk-…/v1`，
+> 表现是**每个模型都无响应、也不报错**（插件当时没有任何提示）。现在两头都堵上了：问答时校验，
+> 以及读取该值时不是 `http(s)://` 就忽略、退回默认端点 —— 已经存坏的账号不用重新登录也能恢复。
 
 > 这里**没有** `authorize` 钩子，是有意的：宿主调用 `authorize(inputs)` 时密钥**不在 inputs 里**
 > （它是独立参数），在 `authorize` 里读 `inputs.key` 永远为空，会把正确密钥判成失败。
@@ -239,3 +279,14 @@ docker exec magpie magpie plugin options word-guard '{
 - `index.mjs` — 插件本体（provider + 自定义头 + 余额 + 签到 + GitHub 登录）
 - `package.json` — 包描述
 - `set-ar-headers.sh` — 改请求头的小工具
+- `usage.test.mjs` — 额度读取与登录流程的单元测试（`npm test`）
+
+## 已知问题与排查
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| 所有模型都无响应，面板 0/7，且**没有任何报错** | 旧版把 `sk-…` 存进了 `metadata.endpoint`，请求打到 `sk-…/v1` | 本版已修：端点问答会拒绝，非 URL 的已存值会被忽略并回退默认端点；无需重新登录 |
+| `/v1` 一律 `401 unauthorized client detected` | 自定义头里放了浏览器 `User-Agent` 等网关不认的标识 | 清掉该头，或用默认（`codex_cli_rs/0.101.0`） |
+| 某模型 `503 … 无可用渠道` | 面板列的是 models.dev 目录里已下架的模型 | 见「模型列表从哪来」，用站点真实列表或关掉该模型 |
+| 模型列表比预期少 | provider 编辑器里只选中了部分模型 | `magpie provider models agentrouter` 看 `pickedFrom`，在编辑器里勾选 |
+| 余额显示旧值 | magpie 在读取失败时保留上次成功的读数（`asOf`） | 看 `asOf` 时间；这不是刚查到的余额 |
