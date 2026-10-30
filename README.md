@@ -123,6 +123,45 @@ docker exec magpie magpie provider models agentrouter
 
 > 站点给你几个模型，以 `GET /v1/models` 为准 —— 它和面板是两回事。
 
+## 内容过滤器：被拒的请求不是限流
+
+AgentRouter 在模型前面挂了自己的**内容过滤器**。它拒绝一段文字时回的是 HTTP **400**、
+`code: "content-blocked"`，既不提密钥也不提额度，看上去很像一个可以重试的临时故障。
+
+实测（2026-10-30，org 站点）：
+
+| 内容 | 结果 |
+|---|---|
+| 普通长文，20 万 token | `200` |
+| 20 万 token 的重复句 | `200` |
+| 含 `transcript` 的短句（3 个 token） | **`400 content-blocked`** |
+| `Here is the transcript of our call.` | **`400 content-blocked`** |
+
+也就是说：**与体积无关，是某些词和自指句式被拦**。具体词表是厂商的，插件不复述；能确定的是
+改写那句话就能过。
+
+### 为什么它会被误当成 429
+
+magpie 判断「换一个服务商是否可能成功」时，会在错误体里匹配额度/限流类词
+（`internal/gateway/fallback.go` 的 `retryable` / `quotaWords`）。被拒的 400 一旦读起来
+像限流，magpie 就会**在多个账号上重试、再故障转移到别的服务商**——最后落在 Codex 上，
+而 Codex 额度耗尽，于是看到的是 **`429 Codex: The usage limit has been reached`**。
+
+这正是「AgentRouter 429 限流」的真实来源：根因是内容被拒，429 是级联产物。
+
+插件现在的做法：把这种拒绝改写为明确说明，且**措辞里不含任何额度/限流类词**
+（有测试守着这一条），于是 magpie 不再重试、不再转移。状态码保持 400，厂商的
+`code` 与 `request id` 都保留，方便报障。
+
+修复前后同一个被拒请求：
+
+| | 状态 | magpie `tries` | 最终落到 |
+|---|---|---|---|
+| 修复前 | 400 → 重试 → 转移 | 5 | Codex 的 **429** |
+| 修复后 | **400**，就地说明 | — | AgentRouter 自己 |
+
+> 遇到这个 400：改写被拒的那句话，或换服务商。等它、重发它，都不会通过。
+
 ## 登录问答（API 密钥方式）
 
 面板或 CLI 的登录问答（**密钥最后单独问**）：

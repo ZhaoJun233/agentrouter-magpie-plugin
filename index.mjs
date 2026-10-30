@@ -751,6 +751,92 @@ function declaredModels() {
   return out;
 }
 
+// ---- what the vendor refuses -----------------------------------------------
+
+// The vendor runs its own content filter in front of the models. It refuses
+// text it doesn't like with HTTP 400 and `code: "content-blocked"` — no
+// rate-limit headers, nothing about the key, and no hint that the *text* is
+// what it objected to.
+//
+// Two things make this worth a word of our own. An agent that reads a bare
+// 400 as a transient gateway fault retries the identical text, and waits, and
+// retries again: the text never becomes acceptable, so the loop never ends.
+// And the shape is indistinguishable from a rate limit at a glance, which is
+// exactly how it gets reported ("AgentRouter 429 限流").
+//
+// So a refusal is rewritten to say what it is, keeping the vendor's own code
+// and request id (both are what support asks for) and adding what to do
+// instead. Every other status is handed back untouched: a real 429, a 401, a
+// 5xx are the caller's business, and guessing at them would be worse than
+// saying nothing.
+//
+// What trips the filter is not size — a 200k-token request of ordinary prose
+// goes through — but particular words and self-referential phrasing. That is
+// the vendor's list to keep, so it is not repeated here; the advice is to
+// rephrase, not to guess at a blocklist.
+//
+// The wording below is deliberately free of quota and rate-limit words
+// ("limit", "quota", "额度", "限流", …). magpie decides whether a failed request
+// may be retried elsewhere by matching those words in the body
+// (internal/gateway/fallback.go's retryable/quotaWords). A refusal that reads
+// like a rate limit is therefore retried on every account and then fails over
+// to another provider — which is how a refused message ends up surfacing as
+// somebody else's 429. Naming the refusal as a refusal is what stops that.
+const CONTENT_BLOCKED = /"code"\s*:\s*"content-blocked"/i;
+
+function refusalNote(id) {
+  const said = id ? ` (request id: ${id})` : "";
+  return (
+    "AgentRouter 的内容过滤器拒绝了这段请求内容" +
+    said +
+    "：被拒的是文字本身，不是账号、密钥或服务状态，所以等待和重发同一段内容都不会通过。" +
+    "请改写被拒的部分（某些词、自指句式常被拒），或改用其他服务商。"
+  );
+}
+
+// explainRefusal passes a reply through unless the vendor refused the text, in
+// which case the body is replaced with one that says so. It never changes a
+// status code: a 400 stays a 400, so nothing upstream starts retrying on a
+// refusal it would only get again.
+async function explainRefusal(res) {
+  if (!res || res.status !== 400) return res;
+  let text;
+  try {
+    text = await res.clone().text();
+  } catch {
+    return res;
+  }
+  if (!CONTENT_BLOCKED.test(text)) return res;
+
+  let code = "content-blocked";
+  let id = "";
+  let message = "";
+  try {
+    const j = JSON.parse(text);
+    const e = j?.error && typeof j.error === "object" ? j.error : j;
+    code = String(e?.code ?? code);
+    message = String(e?.message ?? "");
+    const m = /request id:\s*([A-Za-z0-9]+)/.exec(message);
+    if (m) id = m[1];
+  } catch {
+    // A body that isn't JSON still says content-blocked; that is enough.
+  }
+  const body = JSON.stringify({
+    error: {
+      code,
+      message: refusalNote(id),
+      type: "agent_router_content_blocked",
+      // the vendor's own words, so a support ticket can quote them
+      upstream: message,
+    },
+  });
+  return new Response(body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 // modelsOf asks the vendor for the models this account has. It is the same
 // list every agent sees, and the vendor keeps it current.
 async function modelsOf(provider, { auth } = {}) {
@@ -961,7 +1047,8 @@ export const AgentRouterAuthPlugin = async (input) => {
 
       // The request each completion is sent as. Every model is an OpenAI
       // chat-completions model here, so the body goes on as the gateway wrote
-      // it; only the headers are this plugin's business.
+      // it; only the headers are this plugin's business — and, when the vendor
+      // refuses the text itself, the reason it is refused.
       async loader(getAuth, provider) {
         const auth = await getAuth();
         if (!auth) return {};
@@ -975,7 +1062,7 @@ export const AgentRouterAuthPlugin = async (input) => {
             new Headers(init.headers ?? {}).forEach((v, k) => h.set(k, v));
             applyHeaders(h, headersOf(provider, auth));
             if (key) h.set("Authorization", `Bearer ${key}`);
-            return fetch(input, { ...init, headers: h });
+            return explainRefusal(await fetch(input, { ...init, headers: h }));
           },
         };
       },

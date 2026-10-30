@@ -114,6 +114,65 @@ test('A retired model is never advertised back, whichever path lists it', async 
   }
 });
 
+test('A content-filter refusal is explained, not left looking like a rate limit', async () => {
+  // The vendor's filter answers refused text with 400 content-blocked. Waiting
+  // or retrying never clears it, so an agent that reads it as a transient
+  // gateway failure burns its budget repeating the same text forever.
+  const original = globalThis.fetch;
+  const blocked = JSON.stringify({
+    error: {
+      code: 'content-blocked',
+      message: 'content-blocked (request id: abc)',
+      type: 'agent_router_api_error',
+    },
+  });
+  globalThis.fetch = async () =>
+    new Response(blocked, { status: 400, headers: { 'content-type': 'application/json' } });
+  try {
+    const p = await AgentRouterAuthPlugin();
+    const loader = await p.auth.loader(async () => ({ key: 'sk-example' }), {});
+    const res = await loader.fetch('https://agentrouter.org/v1/responses', {
+      method: 'POST',
+      body: '{}',
+    });
+    const text = await res.text();
+    assert.equal(res.status, 400);
+    assert.match(text, /content-blocked/);
+    assert.match(text, /内容过滤器/);
+    assert.match(text, /改写/);
+
+    // magpie decides "may another provider retry this?" by matching quota /
+    // rate-limit words in the body (fallback.go's retryable/quotaWords). If
+    // the note reads like one of those, a hard refusal is retried on every
+    // account and then fails over — surfacing as another provider's 429.
+    // So the note must not contain any of them.
+    const quotaWords =
+      /quota|insufficient|balance|credit|billing|out of budget|budget (exceeded|exhausted)|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|too many requests|overloaded|余额|额度|欠费|限流|频率|套餐|用量|上限/i;
+    assert.equal(quotaWords.test(text), false, 'the refusal must not read like a quota error');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('Any other refusal is passed through untouched', async () => {
+  const original = globalThis.fetch;
+  const body = JSON.stringify({ error: { code: 'invalid_api_key', message: 'bad key' } });
+  globalThis.fetch = async () =>
+    new Response(body, { status: 401, headers: { 'content-type': 'application/json' } });
+  try {
+    const p = await AgentRouterAuthPlugin();
+    const loader = await p.auth.loader(async () => ({ key: 'sk-example' }), {});
+    const res = await loader.fetch('https://agentrouter.org/v1/responses', {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(res.status, 401);
+    assert.equal(await res.text(), body);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 async function readUsage(auth, responses, provider = {}) {
   const original = globalThis.fetch;
   const calls = [];
