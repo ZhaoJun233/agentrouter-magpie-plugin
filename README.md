@@ -162,6 +162,36 @@ magpie 判断「换一个服务商是否可能成功」时，会在错误体里�
 
 > 遇到这个 400：改写被拒的那句话，或换服务商。等它、重发它，都不会通过。
 
+## 真正的 429：每分钟 token 上限
+
+除了上面的内容拒绝，AgentRouter 确实会真的回 **429**，原文是：
+
+```json
+{"message":"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.","type":"api_error"}
+```
+
+这是**每分钟 token 上限**（Azure 口径），不是账号额度用尽。它有两个麻烦：
+
+1. **不告诉你什么时候恢复** —— 没有 `Retry-After`，没有 reset 时间。
+2. **magpie 会在每个账号上重试** —— 它把这归为 `failRate`（可重试），于是换账号再来；
+   每次重试都在消耗**同一个计数**，反而把账号按在 ceiling 上。重试完再故障转移到别的服务商，
+   若那边额度也用尽，你看到的就是**别人的 429**，而错误体里却是 AgentRouter 的话。
+
+实测一条记录：`provider=codex status=429 tries=5`，`err` 里是 AgentRouter 的
+`exceeded token rate limit`，`err_type=usage_limit_reached` —— 三个服务商混在一起，
+所以它看起来像「AgentRouter 额度用尽」，其实是被拒后被搬到了 Codex。
+
+插件现在的做法：
+
+- 识别这种 429，保留厂商原文与状态码（仍是 429，magpie 继续按限流处理），
+  把说明改成「等约一分钟」「并发越小越不易触发」，并**补上 `retry-after: 60`**
+  （厂商不发，但一分钟就是它的计量窗口）。
+- 其他 429（比如真的额度用尽）**原样透传**，不猜。
+- `package.json` 的 `magpie.maxConcurrency` 从 8 降到 **2**：并发是触发这个上限最直接的原因，
+  插件能改的就是这里。
+
+> 看到这个 429：等一分钟再试，并降低并发。它不是额度问题，等多久都不会让内容变短。
+
 ## 登录问答（API 密钥方式）
 
 面板或 CLI 的登录问答（**密钥最后单独问**）：

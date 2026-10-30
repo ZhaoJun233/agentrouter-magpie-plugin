@@ -154,6 +154,58 @@ test('A content-filter refusal is explained, not left looking like a rate limit'
   }
 });
 
+test('A token-rate-limit 429 says it is a rate cap with a wait, not a spent account', async () => {
+  // The vendor answers its per-minute token cap with 429 and no Retry-After,
+  // and says nothing about when it lifts. magpie retries it on every account
+  // (each retry spending more of the same counted tokens) and then fails over,
+  // so the caller can end up seeing another provider's 429. Saying "wait a
+  // minute" and sending Retry-After is what a caller can act on.
+  const original = globalThis.fetch;
+  const capped = JSON.stringify({
+    message: 'Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.',
+    type: 'api_error',
+  });
+  globalThis.fetch = async () =>
+    new Response(capped, { status: 429, headers: { 'content-type': 'application/json' } });
+  try {
+    const p = await AgentRouterAuthPlugin();
+    const loader = await p.auth.loader(async () => ({ key: 'sk-example' }), {});
+    const res = await loader.fetch('https://agentrouter.org/v1/responses', {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('retry-after'), '60');
+    const text = await res.text();
+    assert.match(text, /gpt-6\.1-sol/);
+    assert.match(text, /一分钟后重试/);
+    // still a rate limit, so magpie keeps treating it as one (failRate)
+    assert.match(text, /token rate limit/i);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('A 429 that is not this cap is passed through untouched', async () => {
+  const original = globalThis.fetch;
+  const body = JSON.stringify({ error: { code: 'insufficient_quota', message: 'out of quota' } });
+  globalThis.fetch = async () =>
+    new Response(body, { status: 429, headers: { 'content-type': 'application/json' } });
+  try {
+    const p = await AgentRouterAuthPlugin();
+    const loader = await p.auth.loader(async () => ({ key: 'sk-example' }), {});
+    const res = await loader.fetch('https://agentrouter.org/v1/responses', {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('retry-after'), null);
+    assert.equal(await res.text(), body);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test('Any other refusal is passed through untouched', async () => {
   const original = globalThis.fetch;
   const body = JSON.stringify({ error: { code: 'invalid_api_key', message: 'bad key' } });

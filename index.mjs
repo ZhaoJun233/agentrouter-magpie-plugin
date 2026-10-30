@@ -751,7 +751,7 @@ function declaredModels() {
   return out;
 }
 
-// ---- what the vendor refuses -----------------------------------------------
+// ---- what the vendor refuses, and what it rate-limits -----------------------
 
 // The vendor runs its own content filter in front of the models. It refuses
 // text it doesn't like with HTTP 400 and `code: "content-blocked"` — no
@@ -794,23 +794,52 @@ function refusalNote(id) {
   );
 }
 
-// explainRefusal passes a reply through unless the vendor refused the text, in
-// which case the body is replaced with one that says so. It never changes a
-// status code: a 400 stays a 400, so nothing upstream starts retrying on a
-// refusal it would only get again.
+// The vendor's per-minute token cap answers 429 with
+//   {"message":"Your requests to <model> for <model> in <region> have
+//    exceeded token rate limit.","type":"api_error"}
+// and says nothing about when it lifts — no Retry-After, no reset time. That
+// matters more than it looks: magpie reads this as a rate limit (failRate),
+// so it retries it on every account of the provider and then fails over to
+// another one. Each of those retries spends more of the very tokens the cap
+// is counting, so the retry is what keeps the account pinned at the ceiling.
+//
+// A plugin cannot stop magpie retrying — the decision is magpie's — but it can
+// make the failure say what it is, so a person reading the card or the agent
+// reading the body knows that the answer is "wait a minute", not "the account
+// is out". The vendor's words and type are kept.
+const TOKEN_RATE_LIMIT = /exceeded\s+token\s+rate\s+limit/i;
+
+function rateLimitNote(model) {
+  return (
+    "AgentRouter 的每分钟 token 上限被触发了" +
+    (model ? `（模型 ${model}）` : "") +
+    "：这是短时速率上限，不是账号额度用尽，也不是密钥失效。等大约一分钟后重试即可。" +
+    "并发数越小越不容易触发；magpie 会在多个账号上重试，而每次重试都在消耗同一个计数。"
+  );
+}
+
+// explainRefusal passes a reply through unless the vendor refused the text or
+// capped its token rate, in which case the body is replaced with one that
+// says which. It never changes a status code: a 400 stays a 400 and a 429
+// stays a 429, so nothing upstream starts retrying on a refusal it would only
+// get again.
 async function explainRefusal(res) {
-  if (!res || res.status !== 400) return res;
+  if (!res || (res.status !== 400 && res.status !== 429)) return res;
   let text;
   try {
     text = await res.clone().text();
   } catch {
     return res;
   }
-  if (!CONTENT_BLOCKED.test(text)) return res;
 
-  let code = "content-blocked";
+  const blocked = res.status === 400 && CONTENT_BLOCKED.test(text);
+  const capped = res.status === 429 && TOKEN_RATE_LIMIT.test(text);
+  if (!blocked && !capped) return res;
+
+  let code = blocked ? "content-blocked" : "token_rate_limit";
   let id = "";
   let message = "";
+  let model = "";
   try {
     const j = JSON.parse(text);
     const e = j?.error && typeof j.error === "object" ? j.error : j;
@@ -818,23 +847,27 @@ async function explainRefusal(res) {
     message = String(e?.message ?? "");
     const m = /request id:\s*([A-Za-z0-9]+)/.exec(message);
     if (m) id = m[1];
+    // the cap's own words name the model twice; keep the first
+    const mm = /requests to (\S+) for \S+/i.exec(message);
+    if (mm) model = mm[1];
   } catch {
-    // A body that isn't JSON still says content-blocked; that is enough.
+    // A body that isn't JSON still says what it says; that is enough.
   }
+
   const body = JSON.stringify({
     error: {
       code,
-      message: refusalNote(id),
-      type: "agent_router_content_blocked",
+      message: blocked ? refusalNote(id) : rateLimitNote(model),
+      type: blocked ? "agent_router_content_blocked" : "agent_router_token_rate_limit",
       // the vendor's own words, so a support ticket can quote them
       upstream: message,
     },
   });
-  return new Response(body, {
-    status: res.status,
-    statusText: res.statusText,
-    headers: { "content-type": "application/json" },
-  });
+  const headers = { "content-type": "application/json" };
+  // A minute is the window the cap counts in, and the vendor sends no
+  // Retry-After of its own. Say so rather than leaving the caller to guess.
+  if (capped) headers["retry-after"] = "60";
+  return new Response(body, { status: res.status, statusText: res.statusText, headers });
 }
 
 // modelsOf asks the vendor for the models this account has. It is the same

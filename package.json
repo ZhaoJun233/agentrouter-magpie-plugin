@@ -27,6 +27,6 @@
     "url": "git+https://github.com/ZhaoJun233/agentrouter-magpie-plugin.git"
   },
   "magpie": {
-    "maxConcurrency": 8
+    "maxConcurrency": 2
   }
 }
