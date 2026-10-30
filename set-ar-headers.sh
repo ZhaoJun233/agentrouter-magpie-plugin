@@ -4,11 +4,12 @@
 #   ./set-ar-headers.sh 'User-Agent: codex_cli_rs/0.101.0'
 #   ./set-ar-headers.sh ''            # 清空，回到插件默认
 #
-# 默认改 Docker 部署的 /opt/magpie/config/magpie/plugin-auth.json，
+# 默认改 Docker 部署常见的 <config>/magpie/plugin-auth.json，
 # 用 AUTH_FILE 覆盖；RESTART=0 可跳过自动重启。
 set -e
 [ $# -eq 1 ] || { echo "用法: $0 '<每行一个 名称: 值>'"; exit 1; }
 
+# 你的配置卷在哪就指哪；这里只是 Docker 部署最常见的位置
 AUTH_FILE="${AUTH_FILE:-/opt/magpie/config/magpie/plugin-auth.json}"
 [ -f "$AUTH_FILE" ] || { echo "找不到 $AUTH_FILE（用 AUTH_FILE=... 指定）"; exit 1; }
 

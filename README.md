@@ -246,20 +246,21 @@ magpie 判断「换一个服务商是否可能成功」时，会在错误体里�
 ./set-ar-headers.sh ''          # 清空，回到默认
 ```
 
-脚本默认读 `/opt/magpie/config/magpie/plugin-auth.json`，用 `AUTH_FILE` 覆盖。
+脚本默认读 `<magpie 配置目录>/magpie/plugin-auth.json`（Docker 部署常见为
+`/opt/magpie/config/magpie/plugin-auth.json`），用 `AUTH_FILE` 覆盖。
 
 三层覆盖（后者覆盖前者）：插件默认 → 模型级 `headers`（面板可改）→ 账号级 `metadata.headers`。
 
 ## 安装
 
 ```bash
-# 下面假设 magpie 以 Docker 跑、配置卷挂在 /opt/magpie/config（按你的部署改）
-VOL=/opt/magpie/config
+# 下面假设 magpie 以 Docker 跑、配置卷挂在 $VOL（按你的部署改）
+VOL=/path/to/magpie/config          # 例：/opt/magpie/config
 
 # 1. 放进容器可见的卷内
 mkdir -p "$VOL/magpie/local-plugins"
 cp -r . "$VOL/magpie/local-plugins/agentrouter"
-chown -R 65532:65532 "$VOL/magpie/local-plugins"
+chown -R 65532:65532 "$VOL/magpie/local-plugins"   # 容器内 uid，按镜像改
 
 # 2. 装进 magpie
 docker exec magpie magpie plugin add /config/magpie/local-plugins/agentrouter
