@@ -1,6 +1,99 @@
 # AgentRouter 插件（magpie）
 
-给 magpie 接入 [agentrouter.org](https://agentrouter.org/)：模型、余额、签到，以及**可自定义请求头**。
+给 magpie 接入 [agentrouter.org](https://agentrouter.org/)：模型调用、余额与用量查询、每日自动签到，以及**可自定义请求头**。
+
+## 🚀 快速上手 (Quick Start)
+
+只需 3 步即可完成插件安装、账号配置与客户端接入：
+
+### 1. 安装插件
+
+#### Docker 部署（推荐）
+将插件克隆至 magpie 配置卷中的本地插件目录：
+```bash
+# 假设 magpie 配置卷挂在宿主机 $VOL（按你的实际部署路径修改）
+VOL=/path/to/magpie/config          # 例：/opt/magpie/config
+
+mkdir -p "$VOL/magpie/local-plugins"
+git clone https://github.com/ZhaoJun233/agentrouter-magpie-plugin.git "$VOL/magpie/local-plugins/agentrouter"
+chown -R 65532:65532 "$VOL/magpie/local-plugins"   # 容器内运行用户 uid，按镜像实际情况修改
+
+# 在 magpie 容器中加载插件
+docker exec magpie magpie plugin add /config/magpie/local-plugins/agentrouter
+```
+
+#### 本地 / 原生进程部署
+```bash
+git clone https://github.com/ZhaoJun233/agentrouter-magpie-plugin.git
+magpie plugin add /path/to/agentrouter-magpie-plugin
+```
+
+---
+
+### 2. 登录并绑定账号
+
+运行交互式登录命令：
+```bash
+docker exec -it magpie magpie plugin login agentrouter
+# 非 Docker 环境直接运行：magpie plugin login agentrouter
+```
+
+根据需求选择以下两种登录方式之一：
+
+#### 方案 A：GitHub 授权登录（推荐，支持读取额度）
+适合已绑定 GitHub 的 AgentRouter 账号，可自动获取 key、用户 ID 并读取实时余额：
+1. **获取系统访问令牌**：登录 [AgentRouter 官网](https://agentrouter.org/)，点击右上角头像进入「个人设置」→「访问令牌」，复制**系统访问令牌**（注意：**不是** `sk-…` API 密钥，也**不是** GitHub Personal Access Token）。
+2. 在终端登录交互中选择 `用 GitHub 登录 AgentRouter（推荐）`。
+3. 按提示粘贴第 1 步复制的系统访问令牌。
+4. 终端会生成 GitHub 授权 URL 并在浏览器中打开；完成授权后，浏览器会跳转至 `agentrouter.org/oauth/github/magpie?...`。
+   > ⚠️ **跳转后显示「页面未找到」是正常现象**（站点在此特定子路由不会提早自动兑换授权码）。请直接从浏览器地址栏**完整复制该整条 URL**（包含 `code=…`）。
+5. 粘贴回终端回车，插件将自动完成凭据保存与登录。
+
+#### 方案 B：API 密钥快速登录（最简，仅模型对话）
+如果仅需调用模型进行聊天/编程，无需读取余额与签到：
+1. **获取 API 密钥**：登录 AgentRouter，在「令牌」页面新建或复制已有密钥（`sk-…`）。
+2. 在终端登录交互中选择 `AgentRouter API 密钥`。
+3. 按照提示输入参数：
+   - **请求端点**：直接按**回车留空**（默认 `https://agentrouter.org`，**切勿在此处填入 `sk-…` 密钥**）。
+   - **站点**：回车默认选择 `agentrouter.org`。
+   - **用户名 / 密码 / Cookie / 用户ID / 自定义头**：仅需对话时**全部直接按回车跳过**；如需密码自动签到，可填入站点的用户名与独立密码。
+   - **API 密钥**：最后单独提示时，粘贴你的 `sk-…` 密钥。
+
+---
+
+### 3. 测试与验证
+
+绑定完成后，执行以下命令验证状态：
+
+```bash
+# 1. 测试模型对话是否正常响应
+docker exec magpie magpie provider test agentrouter
+# 成功时输出类似：✓ responses  3469 ms · gpt-6-astra
+
+# 2. 查看已识别并激活的模型列表
+docker exec magpie magpie provider models agentrouter
+
+# 3. 检查账号额度与用量读取
+docker exec magpie magpie quota agentrouter
+```
+
+---
+
+### 4. 在客户端中调用
+
+在任何兼容 OpenAI 接口的客户端（如 Chatbox、NextChat、OpenCode、Cherry Studio、Cursor 等）中配置：
+
+- **API 接口地址 (Base URL)**：`https://你的-magpie-域名/v1`（本地直连填 `http://localhost:3425/v1`）
+- **API Key**：你在 magpie 中配置的 Caller Key（网关访问密钥）
+- **模型名称**：
+  - `agentrouter/gpt-5.6-sol`
+  - `agentrouter/gpt-6-astra`
+  - `agentrouter/gpt-6.1-sol`
+  （或你在 magpie 中配置的统一全局模型名称）
+
+> 💡 **请求头说明**：AgentRouter 网关强制校验客户端标识（User-Agent 白名单）。本插件**默认已自动附带官方兼容的客户端请求头**，日常在任意客户端发起调用均无需做任何额外请求头配置。
+
+---
 
 ## 登录方式与需要填写的内容
 
@@ -251,30 +344,9 @@ magpie 判断「换一个服务商是否可能成功」时，会在错误体里�
 
 三层覆盖（后者覆盖前者）：插件默认 → 模型级 `headers`（面板可改）→ 账号级 `metadata.headers`。
 
-## 安装
+## 手动配置文件格式（plugin-auth.json）
 
-```bash
-# 下面假设 magpie 以 Docker 跑、配置卷挂在 $VOL（按你的部署改）
-VOL=/path/to/magpie/config          # 例：/opt/magpie/config
-
-# 1. 放进容器可见的卷内
-mkdir -p "$VOL/magpie/local-plugins"
-cp -r . "$VOL/magpie/local-plugins/agentrouter"
-chown -R 65532:65532 "$VOL/magpie/local-plugins"   # 容器内 uid，按镜像改
-
-# 2. 装进 magpie
-docker exec magpie magpie plugin add /config/magpie/local-plugins/agentrouter
-
-# 3. 登录（交互式）
-docker exec magpie magpie plugin login agentrouter
-```
-
-不是 Docker 的话，把插件目录直接交给 magpie 即可：
-
-```bash
-magpie plugin add /path/to/agentrouter
-magpie plugin login agentrouter
-```
+除了上述 `magpie plugin login` 交互式登录外，也可以直接手动编辑配置文件。
 
 `plugin-auth.json` 的形态：
 
@@ -297,7 +369,7 @@ magpie plugin login agentrouter
 }
 ```
 
-改完 `docker restart magpie`。
+改完后执行 `docker restart magpie`（或重启 magpie 进程）生效。
 
 ## 端点与站点是分开的
 
@@ -306,12 +378,9 @@ magpie plugin login agentrouter
 
 所以你可以请求打 `agentrouter.org`、余额和签到走 `ps.air-outer.com`，两者互不影响。
 
-## 验证
+## 额度百分比与字段说明
 
 ```bash
-docker exec magpie magpie provider test agentrouter
-#   ✓ responses  3469 ms · gpt-6-astra
-
 docker exec magpie magpie quota | grep -i agentrouter
 #   agentrouter · example-user · API key …XXXX   subscription  Balance 25% ($150.00 / $200.00)
 #   上述为虚构示例；实际输出也可能提示“累计消耗…；剩余额度未知”。
