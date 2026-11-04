@@ -263,27 +263,32 @@ magpie 判断「换一个服务商是否可能成功」时，会在错误体里�
 {"message":"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.","type":"api_error"}
 ```
 
-这是**每分钟 token 上限**（Azure 口径），不是账号额度用尽。它有两个麻烦：
+这是上游明确报告的 **token 速率上限**，不能据此断言账号余额用尽。厂商没有给出
+具体计数范围、准确阈值或恢复时间；也不能仅凭多个账号同时失败就断言它们共用同一个计数器。
 
-1. **不告诉你什么时候恢复** —— 没有 `Retry-After`，没有 reset 时间。
-2. **magpie 会在每个账号上重试** —— 它把这归为 `failRate`（可重试），于是换账号再来；
-   每次重试都在消耗**同一个计数**，反而把账号按在 ceiling 上。重试完再故障转移到别的服务商，
-   若那边额度也用尽，你看到的就是**别人的 429**，而错误体里却是 AgentRouter 的话。
+### 为什么会显示 200 / 零用量空回，同时又出现 429
 
-实测一条记录：`provider=codex status=429 tries=5`，`err` 里是 AgentRouter 的
-`exceeded token rate limit`，`err_type=usage_limit_reached` —— 三个服务商混在一起，
-所以它看起来像「AgentRouter 额度用尽」，其实是被拒后被搬到了 Codex。
+上游会先发 **HTTP 200 + `text/event-stream`**，随后在流中报告失败。
+旧插件只检查 HTTP 400/429，因此漏掉这种流内错误，也没有补上等待时间。
+magpie 识别流内错误为 429 后，可能立即换账号，再对同一账号进行短间隔重试。
+上游未生成有效回答时可能记为零用量，但**零用量本身不是限流的证据**。
 
-插件现在的做法：
+修复后的处理：
 
-- 识别这种 429，保留厂商原文与状态码（仍是 429，magpie 继续按限流处理），
-  把说明改成「等约一分钟」「并发越小越不易触发」，并**补上 `retry-after: 60`**
-  （厂商不发，但一分钟就是它的计量窗口）。
-- 其他 429（比如真的额度用尽）**原样透传**，不猜。
-- `package.json` 的 `magpie.maxConcurrency` 从 8 降到 **2**：并发是触发这个上限最直接的原因，
-  插件能改的就是这里。
+- 在首段正文、推理或工具调用发出前，检查 SSE 的元数据前缀。明确的 token 速率错误
+  转成 **HTTP 429**；明确的内容拒绝转成 400。支持嵌套 JSON 错误及 HTTP 200 JSON 错误信封。
+- **保留上游 `Retry-After` 和 request-id**；仅对已识别的 token 速率错误，在上游没有
+  给出等待时间时补 `Retry-After: 60`。60 秒是保守建议，**不保证一分钟后恢复**。
+  magpie 对超过 8 秒的等待不再做秒级同账号重试；跨账号调度仍由宿主决定。
+- `response.completed` 明确给出空 `output`、输入/输出用量均为零且此前无有效输出时，
+  单独报 **502 `agent_router_empty_response`**，不会伪装成限流。
+- 正常响应逐字节透传。已有正文、推理或工具调用后的错误不重新包装，避免丢失部分输出
+  或诱发工具重复执行。未知错误、普通 429、截断流也不会凭空变成 token 限流。
+- 只检查最多 **64 KiB / 15 秒** 的流前缀；超过任一边界就原样放行，不缓存整段回答。
+  插件自身不发起重试，也不绕过上游限制；默认 `magpie.maxConcurrency` 保持 **2**。
 
-> 看到这个 429：等一分钟再试，并降低并发。它不是额度问题，等多久都不会让内容变短。
+> 看到这个 429：遵循等待提示，降低并发并评估上下文大小。如果持续发生，应向上游提供
+> request-id 查询真实阈值。插件修复的是错误识别与退避信息，不会增加上游可用容量。
 
 ## 登录问答（API 密钥方式）
 
@@ -416,9 +421,12 @@ docker exec magpie magpie plugin options word-guard '{
 ## 文件
 
 - `index.mjs` — 插件本体（provider + 自定义头 + 余额 + 签到 + GitHub 登录）
+- `response.mjs` — HTTP / SSE 早期失败识别与有界流透传（安装时必须一起复制）
 - `package.json` — 包描述
 - `set-ar-headers.sh` — 改请求头的小工具
-- `usage.test.mjs` — 额度读取与登录流程的单元测试（`npm test`）
+- `usage.test.mjs` — 额度读取、登录与 HTTP 错误回归测试
+- `loader-stream.test.mjs` — 流内错误、空完成、成功字节、工具调用等回归测试
+- `response-bounds.test.mjs` — 有界缓存、检查超时与取消测试（统一运行 `npm test`）
 
 ## 已知问题与排查
 

@@ -1,3 +1,5 @@
+import { explainResponse } from "./response.mjs";
+
 // AgentRouter (agentrouter.org) for magpie / OpenCode.
 //
 // Three things make this vendor different from a plain OpenAI-compatible
@@ -751,125 +753,6 @@ function declaredModels() {
   return out;
 }
 
-// ---- what the vendor refuses, and what it rate-limits -----------------------
-
-// The vendor runs its own content filter in front of the models. It refuses
-// text it doesn't like with HTTP 400 and `code: "content-blocked"` — no
-// rate-limit headers, nothing about the key, and no hint that the *text* is
-// what it objected to.
-//
-// Two things make this worth a word of our own. An agent that reads a bare
-// 400 as a transient gateway fault retries the identical text, and waits, and
-// retries again: the text never becomes acceptable, so the loop never ends.
-// And the shape is indistinguishable from a rate limit at a glance, which is
-// exactly how it gets reported ("AgentRouter 429 限流").
-//
-// So a refusal is rewritten to say what it is, keeping the vendor's own code
-// and request id (both are what support asks for) and adding what to do
-// instead. Every other status is handed back untouched: a real 429, a 401, a
-// 5xx are the caller's business, and guessing at them would be worse than
-// saying nothing.
-//
-// What trips the filter is not size — a 200k-token request of ordinary prose
-// goes through — but particular words and self-referential phrasing. That is
-// the vendor's list to keep, so it is not repeated here; the advice is to
-// rephrase, not to guess at a blocklist.
-//
-// The wording below is deliberately free of quota and rate-limit words
-// ("limit", "quota", "额度", "限流", …). magpie decides whether a failed request
-// may be retried elsewhere by matching those words in the body
-// (internal/gateway/fallback.go's retryable/quotaWords). A refusal that reads
-// like a rate limit is therefore retried on every account and then fails over
-// to another provider — which is how a refused message ends up surfacing as
-// somebody else's 429. Naming the refusal as a refusal is what stops that.
-const CONTENT_BLOCKED = /"code"\s*:\s*"content-blocked"/i;
-
-function refusalNote(id) {
-  const said = id ? ` (request id: ${id})` : "";
-  return (
-    "AgentRouter 的内容过滤器拒绝了这段请求内容" +
-    said +
-    "：被拒的是文字本身，不是账号、密钥或服务状态，所以等待和重发同一段内容都不会通过。" +
-    "请改写被拒的部分（某些词、自指句式常被拒），或改用其他服务商。"
-  );
-}
-
-// The vendor's per-minute token cap answers 429 with
-//   {"message":"Your requests to <model> for <model> in <region> have
-//    exceeded token rate limit.","type":"api_error"}
-// and says nothing about when it lifts — no Retry-After, no reset time. That
-// matters more than it looks: magpie reads this as a rate limit (failRate),
-// so it retries it on every account of the provider and then fails over to
-// another one. Each of those retries spends more of the very tokens the cap
-// is counting, so the retry is what keeps the account pinned at the ceiling.
-//
-// A plugin cannot stop magpie retrying — the decision is magpie's — but it can
-// make the failure say what it is, so a person reading the card or the agent
-// reading the body knows that the answer is "wait a minute", not "the account
-// is out". The vendor's words and type are kept.
-const TOKEN_RATE_LIMIT = /exceeded\s+token\s+rate\s+limit/i;
-
-function rateLimitNote(model) {
-  return (
-    "AgentRouter 的每分钟 token 上限被触发了" +
-    (model ? `（模型 ${model}）` : "") +
-    "：这是短时速率上限，不是账号额度用尽，也不是密钥失效。等大约一分钟后重试即可。" +
-    "并发数越小越不容易触发；magpie 会在多个账号上重试，而每次重试都在消耗同一个计数。"
-  );
-}
-
-// explainRefusal passes a reply through unless the vendor refused the text or
-// capped its token rate, in which case the body is replaced with one that
-// says which. It never changes a status code: a 400 stays a 400 and a 429
-// stays a 429, so nothing upstream starts retrying on a refusal it would only
-// get again.
-async function explainRefusal(res) {
-  if (!res || (res.status !== 400 && res.status !== 429)) return res;
-  let text;
-  try {
-    text = await res.clone().text();
-  } catch {
-    return res;
-  }
-
-  const blocked = res.status === 400 && CONTENT_BLOCKED.test(text);
-  const capped = res.status === 429 && TOKEN_RATE_LIMIT.test(text);
-  if (!blocked && !capped) return res;
-
-  let code = blocked ? "content-blocked" : "token_rate_limit";
-  let id = "";
-  let message = "";
-  let model = "";
-  try {
-    const j = JSON.parse(text);
-    const e = j?.error && typeof j.error === "object" ? j.error : j;
-    code = String(e?.code ?? code);
-    message = String(e?.message ?? "");
-    const m = /request id:\s*([A-Za-z0-9]+)/.exec(message);
-    if (m) id = m[1];
-    // the cap's own words name the model twice; keep the first
-    const mm = /requests to (\S+) for \S+/i.exec(message);
-    if (mm) model = mm[1];
-  } catch {
-    // A body that isn't JSON still says what it says; that is enough.
-  }
-
-  const body = JSON.stringify({
-    error: {
-      code,
-      message: blocked ? refusalNote(id) : rateLimitNote(model),
-      type: blocked ? "agent_router_content_blocked" : "agent_router_token_rate_limit",
-      // the vendor's own words, so a support ticket can quote them
-      upstream: message,
-    },
-  });
-  const headers = { "content-type": "application/json" };
-  // A minute is the window the cap counts in, and the vendor sends no
-  // Retry-After of its own. Say so rather than leaving the caller to guess.
-  if (capped) headers["retry-after"] = "60";
-  return new Response(body, { status: res.status, statusText: res.statusText, headers });
-}
-
 // modelsOf asks the vendor for the models this account has. It is the same
 // list every agent sees, and the vendor keeps it current.
 async function modelsOf(provider, { auth } = {}) {
@@ -1078,10 +961,9 @@ export const AgentRouterAuthPlugin = async (input) => {
         },
       ],
 
-      // The request each completion is sent as. Every model is an OpenAI
-      // chat-completions model here, so the body goes on as the gateway wrote
-      // it; only the headers are this plugin's business — and, when the vendor
-      // refuses the text itself, the reason it is refused.
+      // Leave the request body as the gateway wrote it. Normalize known early
+      // failures even when the vendor puts them inside an HTTP 200 stream;
+      // response.mjs preserves successful bytes and never retries a request.
       async loader(getAuth, provider) {
         const auth = await getAuth();
         if (!auth) return {};
@@ -1095,7 +977,7 @@ export const AgentRouterAuthPlugin = async (input) => {
             new Headers(init.headers ?? {}).forEach((v, k) => h.set(k, v));
             applyHeaders(h, headersOf(provider, auth));
             if (key) h.set("Authorization", `Bearer ${key}`);
-            return explainRefusal(await fetch(input, { ...init, headers: h }));
+            return explainResponse(await fetch(input, { ...init, headers: h }));
           },
         };
       },

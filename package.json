@@ -5,11 +5,12 @@
   "type": "module",
   "main": "./index.mjs",
   "scripts": {
-    "test": "node --test usage.test.mjs"
+    "test": "node --test usage.test.mjs loader-stream.test.mjs response-bounds.test.mjs"
   },
   "exports": "./index.mjs",
   "files": [
     "index.mjs",
+    "response.mjs",
     "README.md",
     "LICENSE"
   ],

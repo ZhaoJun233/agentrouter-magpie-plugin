@@ -178,7 +178,8 @@ test('A token-rate-limit 429 says it is a rate cap with a wait, not a spent acco
     assert.equal(res.headers.get('retry-after'), '60');
     const text = await res.text();
     assert.match(text, /gpt-6\.1-sol/);
-    assert.match(text, /一分钟后重试/);
+    assert.match(text, /一分钟后再试/);
+    assert.match(text, /不保证届时已恢复/);
     // still a rate limit, so magpie keeps treating it as one (failRate)
     assert.match(text, /token rate limit/i);
   } finally {
