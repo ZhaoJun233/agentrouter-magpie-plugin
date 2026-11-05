@@ -1,5 +1,6 @@
 import { explainResponse } from "./response.mjs";
-import { prepareResponsesRequest } from "./request.mjs";
+import { prepareRequest } from "./request.mjs";
+import { loadTextFilter } from "./content-filter.mjs";
 
 // AgentRouter (agentrouter.org) for magpie / OpenCode.
 //
@@ -898,6 +899,7 @@ export const AgentRouterAuthPlugin = async (input) => {
   // provider and account — which every caller already passes.
   codexHeaders = () => input?.magpie?.option?.(PROVIDER, "send-codex-headers") !== false;
   const portableResponses = () => input?.magpie?.option?.(PROVIDER, "portable-responses") !== false;
+  const textFilterEnabled = () => input?.magpie?.option?.(PROVIDER, "text-filter") !== false;
   return {
     // The provider before anyone signs in: the models the vendor serves, so the
     // row has something to show, and the shape each listed one takes.
@@ -1079,6 +1081,7 @@ export const AgentRouterAuthPlugin = async (input) => {
       async loader(getAuth, provider) {
         const auth = await getAuth();
         if (!auth) return {};
+        const textFilter = textFilterEnabled() ? await loadTextFilter() : null;
         const base = apiBase(provider, auth);
         return {
           baseURL: base,
@@ -1090,7 +1093,10 @@ export const AgentRouterAuthPlugin = async (input) => {
             applyHeaders(h, headersOf(provider, auth));
             if (key) h.set("Authorization", `Bearer ${key}`);
             const requestInit = { ...init, headers: h };
-            const prepared = portableResponses() ? await prepareResponsesRequest(input, requestInit) : requestInit;
+            const prepared = await prepareRequest(input, requestInit, {
+              portableResponses: portableResponses(),
+              textFilter: textFilterEnabled() ? textFilter : null,
+            });
             return explainResponse(await fetch(input, prepared));
           },
         };
@@ -1102,9 +1108,15 @@ export const AgentRouterAuthPlugin = async (input) => {
       // Switches the user can turn on the provider's editor.
       options: [
         {
+          key: "text-filter",
+          label: "Filter configured prose before sending",
+          default: true,
+          description: "Uses content-filter.local.json; no guessed terms. Preserves recognized Markdown code, tool data and encrypted state. Reload after editing rules.",
+        },
+        {
           key: "portable-responses",
           label: "Replay complete Responses items inline",
-          description: "Remove resource-local IDs only when inline content is available; preserve call_id and encrypted content. Reference-only history still requires the original resource. Off preserves the original request body.",
+          description: "Remove resource-local IDs only when inline content is available; preserve call_id and encrypted content. Reference-only history still requires the original resource. Off disables ID replay only; text-filter is independent.",
           default: true,
         },
         {

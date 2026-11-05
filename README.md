@@ -218,11 +218,11 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 
 边界：
 
-- **不删** `previous_response_id`、`conversation` 或 `item_reference`；这些请求按原样发送，因为插件并不知道它们指向的完整历史。客户端需要重发完整内联历史，或由上游固定到原资源。
+- **不删** `previous_response_id`、`conversation` 或 `item_reference`；这些请求不做 ID 重写，因为插件并不知道它们指向的完整历史。0.1.3 的独立文本过滤仍可替换请求中可见的匹配正文，但不能处理引用背后的历史。客户端需要重发完整内联历史，或由上游固定到原资源。
 - **不删改推理及 compaction 条目**，包括它们的 ID、摘要和加密内容。`store:false` 不会让加密状态跨资源通用；不同密钥无法解密时仍须原资源。
 - 非空引用注释、未知消息字段和未知条目类型保留原样，不为修复而静默丢失内容。文件/图像/容器等资源引用也不递归删除。
 - 只处理最多 4 MiB 的 JSON 请求；读取 Request 副本最多 2 秒，支持取消。超限、非 JSON、压缩正文和其他端点不改写。不会自动重试，更不会重放用户历史。
-- 关闭提供商选项 **Replay complete Responses items inline** 可恢复原始正文透传。只有服务端引用、没有完整内联正文的旧会话，不保证仅升级插件就能继续。
+- 关闭提供商选项 **Replay complete Responses items inline** 只关闭 ID 重写；若启用了下文的本地词表，文本过滤仍独立生效。两个选项都关闭才恢复原始正文透传。只有服务端引用、没有完整内联正文的旧会话，不保证仅升级插件就能继续。
 
 当此错误仍出现，插件返回 `agent_router_resource_mismatch`，保留上游消息与可识别的 trace ID，说明需要完整内联历史或同一上游资源，而不是报成敏感词错误。
 
@@ -261,7 +261,7 @@ docker exec magpie magpie provider models agentrouter
 AgentRouter 在模型前面挂了自己的**内容过滤器**。它拒绝一段文字时回的是 HTTP **400**、
 `code: "content-blocked"`，既不提密钥也不提额度，看上去很像一个可以重试的临时故障。
 
-实测（2026-10-30，org 站点）：
+仓库保留的历史实验记录（2026-10-30，org 站点；不是当前版本的复测结果）：
 
 | 内容 | 结果 |
 |---|---|
@@ -270,8 +270,7 @@ AgentRouter 在模型前面挂了自己的**内容过滤器**。它拒绝一段�
 | 含 `transcript` 的短句（3 个 token） | **`400 content-blocked`** |
 | `Here is the transcript of our call.` | **`400 content-blocked`** |
 
-也就是说：**与体积无关，是某些词和自指句式被拦**。具体词表是厂商的，插件不复述；能确定的是
-改写那句话就能过。
+这些历史样例只能说明当时部分短句也被拦，不能外推为厂商的当前词表，也不能证明每次拦截都由某个词触发。只有 `content-blocked`、没有命中词或审核类别时，插件不能自动判定是哪段文字导致拒绝。
 
 ### 为什么它会被误当成 429
 
@@ -293,7 +292,33 @@ magpie 判断「换一个服务商是否可能成功」时，会在错误体里�
 | 修复前 | 400 → 重试 → 转移 | 5 | Codex 的 **429** |
 | 修复后 | **400**，就地说明 | — | AgentRouter 自己 |
 
-> 遇到这个 400：改写被拒的那句话，或换服务商。等它、重发它，都不会通过。
+> 遇到这个 400：保留 request id，向服务商核实拒绝原因。只有明确需要替换的文本才加入下方词表；不要盲目重试或把可疑词猜测当成已证实结论。过滤后仍可能被拒。
+
+### 本地词表自动替换（0.1.3）
+
+提供商选项 **Filter configured prose before sending**（`text-filter`，默认开启）控制发送前替换。**没有词表或 `terms` 为空时不改正文**；不内置猜测词，不自动学习被拒的私密请求，不发送探测请求，也不追加重试。
+
+1. 将插件目录中的 [content-filter.example.json](<content-filter.example.json>) 复制为 `content-filter.local.json`，与 [index.mjs](<index.mjs>) 放在同一目录。magpie 使用的是**服务端安装目录**，不是浏览器本机目录。
+2. 仅填写自己确认需要替换的词；词表按字面量匹配，不支持正则。示例中的值仅为占位，不代表厂商拦截词：
+
+   ```json
+   { "terms": ["待替换的自定义文本"], "caseSensitive": true }
+   ```
+
+3. 词表属于私有配置，建议限制为仅运行插件的用户可读写。它已被 Git 忽略，也不在 npm 发布文件清单中；不要将真实词表放进示例文件、命令行参数或调试输出。
+4. 保存后重新加载插件。运行中的 loader 使用加载时的快照；改文件本身不会立即改变在途请求。关闭 `text-filter` 可停用，重新开启后加载词表。
+
+行为与边界：
+
+- 仅处理 `POST .../responses` 的 `instructions`、字符串 `input`，以及 `input` 中普通 user/assistant/system/developer 消息的文本片段。Chat/Anthropic 客户端请求须先由 magpie 翻译为 Responses。`/responses/compact` 等其他端点不处理。
+- 默认区分大小写；`caseSensitive:false` 可忽略大小写。按最长字面量优先、非重叠替换成 `[FILTERED]`，不递归替换生成的标记，不自动添加单词边界。短词可能命中更长词的一部分，配置前应自行评估。
+- **不改**工具调用参数、工具结果、工具 schema、业务 ID、模型名、metadata、文件/图片、推理/compaction/加密状态和服务端历史引用。Markdown 行内代码、根级反引号/波浪线围栏和未闭合代码段保守保留。含缩进代码的段落不改，但其前后独立段落仍可过滤；遇到引用/列表容器中的围栏，为避免误判结束位置，整个文本字段不改。带引用注释或未知字段的片段也不改。它不是通用的密钥防泄漏或数据防泄漏系统，不能保证屏蔽上述范围里的词。
+- 仅匹配可见的普通正文；保留被跳过内容可能意味着上游仍会拒绝。并非找到了厂商完整词表，也不保证对某次 `content-blocked` 有效。
+- 没有命中时，不因过滤而重新序列化请求；有命中时仅替换发送副本，清理旧长度/摘要头，不回写本地历史。独立的 `portable-responses` 选项仍可执行 ID 兼容处理。
+- 请求沿用 4 MiB UTF-8 / Request 副本 2 秒的边界。超限、无法读取、非 JSON、压缩正文按原有逻辑透传，**不是已过滤的证明**。
+- 词表最多 32 KiB、128 条；每条最多 256 个 UTF-16 代码单元，总计最多 8192。不存在/空词表视为停用；配置存在但 JSON、结构、编码或读取失败时，启用状态下拒绝创建 loader，而不是静默忽略。错误只给固定提示，不输出词条或请求正文。
+
+实现：[content-filter.mjs](<content-filter.mjs>)；回归测试：[content-filter.test.mjs](<content-filter.test.mjs>)。
 
 ## 真正的 429：每分钟 token 上限
 
@@ -437,9 +462,9 @@ docker exec magpie magpie quota | grep -i agentrouter
 `Balance` 里的百分比是 magpie 的 `Used` 字段（剩余 = 100 − 已用），金额在 `Amount` / `Limit`。
 **不要把美元金额塞进 `Used`** —— 例如把 $250 当成 250%，会使剩余被截成 0%。
 
-## 敏感词正则过滤（配套）
+## 额外的本地拒绝策略（可选社区中间件）
 
-用社区中间件，不必自己写：
+这是独立于上文 0.1.3 发送前替换的 **reject** 策略，不会替换文字，也不能据此判断 AgentRouter 的真实拦截词。现有部署若需要正则拒绝，可另行评估社区中间件：
 
 ```bash
 docker exec magpie magpie plugin add @magpie-community/middleware-word-guard

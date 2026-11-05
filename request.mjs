@@ -1,3 +1,5 @@
+import { redactResponsesBody } from "./content-filter.mjs";
+
 // Replay complete items inline instead of asking a load-balanced resource to
 // retrieve them by an old item ID. Never remove call_id or opaque contents.
 function isInlinePart(part) {
@@ -64,6 +66,11 @@ async function readClone(request, signal) {
 }
 
 export async function prepareResponsesRequest(input, init = {}) {
+  return prepareRequest(input, init);
+}
+
+export async function prepareRequest(input, init = {}, { portableResponses = true, textFilter = null } = {}) {
+  if (!portableResponses && !textFilter) return init;
   const request = input instanceof Request ? input : null;
   let pathname;
   try { pathname = new URL(request ? request.url : input).pathname; } catch { return init; }
@@ -78,10 +85,21 @@ export async function prepareResponsesRequest(input, init = {}) {
   if (typeof text !== "string" || text.length > MAX_BODY || new TextEncoder().encode(text).byteLength > MAX_BODY) return init;
   let body;
   try { body = JSON.parse(text); } catch { return init; }
-  if (!body || typeof body !== "object" || !Array.isArray(body.input)) return init;
-  // These pointers carry context we do not have. Leave stateful requests alone,
-  // rather than silently turning a continuation into a new conversation.
-  if (body.previous_response_id || body.conversation || body.input.some(item => item?.type === "item_reference")) return init;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return init;
+  const filtered = redactResponsesBody(body, textFilter);
+  body = filtered.body;
+  const replayed = portableResponses && replayInline(body);
+  if (!filtered.replacements && !replayed) return init;
+  if (replayed) body.store = false;
+  for (const name of ["content-length", "content-md5", "digest", "content-digest"]) headers.delete(name);
+  return { ...init, body: JSON.stringify(body), headers };
+}
+
+function replayInline(body) {
+  // Pointers carry context we cannot retrieve. Filtering visible prose must not
+  // silently discard that context or turn a continuation into a new conversation.
+  if (!Array.isArray(body.input) || body.previous_response_id || body.conversation ||
+      body.input.some(item => item?.type === "item_reference")) return false;
   let changed = false;
   for (const item of body.input) {
     if (!hasInlineContent(item) || !Object.hasOwn(item, "id")) continue;
@@ -95,10 +113,5 @@ export async function prepareResponsesRequest(input, init = {}) {
     }
     changed = true;
   }
-  // Do not change byte-identical requests that need no repair. In particular,
-  // do not claim to migrate unknown/opaque item kinds or reference-only history.
-  if (!changed) return init;
-  body.store = false;
-  for (const name of ["content-length", "content-md5", "digest", "content-digest"]) headers.delete(name);
-  return { ...init, body: JSON.stringify(body), headers };
+  return changed;
 }

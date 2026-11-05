@@ -1,11 +1,11 @@
 {
   "name": "opencode-agentrouter-auth",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "AgentRouter (agentrouter.org) provider for magpie and OpenCode: GitHub or API-key sign-in, configurable request headers, balance and the daily check-in",
   "type": "module",
   "main": "./index.mjs",
   "scripts": {
-    "test": "node --test usage.test.mjs loader-stream.test.mjs response-bounds.test.mjs checkin.test.mjs local-checkin.test.mjs local-checkin.integration.test.mjs request-replay.test.mjs",
+    "test": "node --test usage.test.mjs loader-stream.test.mjs response-bounds.test.mjs checkin.test.mjs local-checkin.test.mjs local-checkin.integration.test.mjs request-replay.test.mjs content-filter.test.mjs",
     "test:headers": "python3 set-ar-headers.test.py"
   },
   "exports": "./index.mjs",
@@ -13,6 +13,8 @@
     "index.mjs",
     "response.mjs",
     "request.mjs",
+    "content-filter.mjs",
+    "content-filter.example.json",
     "local-checkin.mjs",
     "LOCAL-CHECKIN.md",
     "README.md",
