@@ -1,0 +1,104 @@
+// Replay complete items inline instead of asking a load-balanced resource to
+// retrieve them by an old item ID. Never remove call_id or opaque contents.
+function isInlinePart(part) {
+  if (!part || typeof part !== "object") return false;
+  if (["input_text", "input_image", "input_file", "input_audio"].includes(part.type)) return true;
+  if (part.type !== "output_text" || typeof part.text !== "string") return false;
+  return Object.keys(part).every(key => ["type", "text", "annotations"].includes(key)) &&
+    (part.annotations == null || Array.isArray(part.annotations) && part.annotations.length === 0);
+}
+
+function hasInlineContent(item) {
+  if (!item || typeof item !== "object") return false;
+  switch (item.type) {
+    case undefined:
+    case "message":
+      return ["user", "assistant", "system", "developer"].includes(item.role) &&
+        Object.keys(item).every(key => ["type", "id", "role", "content", "status", "phase"].includes(key)) &&
+        (typeof item.content === "string" && item.content.length > 0 ||
+          Array.isArray(item.content) && item.content.length > 0 && item.content.every(isInlinePart));
+    case "function_call":
+      return typeof item.call_id === "string" && item.call_id.length > 0 &&
+        typeof item.name === "string" && item.name.length > 0 && typeof item.arguments === "string";
+    case "function_call_output":
+      return typeof item.call_id === "string" && item.call_id.length > 0 &&
+        (typeof item.output === "string" || Array.isArray(item.output));
+    // Reasoning IDs are required by the published input schema; encrypted
+    // state has no cross-resource portability guarantee. Preserve it intact.
+    case "reasoning":
+      return false;
+    default:
+      return false;
+  }
+}
+
+const MAX_BODY = 4 * 1024 * 1024;
+
+async function readClone(request, signal) {
+  if (signal?.aborted) return null;
+  let reader, timer, abort;
+  try {
+    reader = request.clone().body?.getReader();
+    if (!reader) return null;
+    const stopped = new Promise((_, reject) => {
+      abort = () => reject(new Error("Request preparation stopped"));
+      timer = setTimeout(abort, 2000);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let bytes = 0, text = "";
+    for (;;) {
+      const { value, done } = await Promise.race([reader.read(), stopped]);
+      if (done) return text + decoder.decode();
+      bytes += value.byteLength;
+      if (bytes > MAX_BODY) return null;
+      text += decoder.decode(value, { stream: true });
+    }
+  } catch { return null; }
+  finally {
+    clearTimeout(timer);
+    if (abort) signal?.removeEventListener("abort", abort);
+    // A tee cancellation can wait for the original consumer. Never await it.
+    if (reader) void reader.cancel().catch(() => {});
+  }
+}
+
+export async function prepareResponsesRequest(input, init = {}) {
+  const request = input instanceof Request ? input : null;
+  let pathname;
+  try { pathname = new URL(request ? request.url : input).pathname; } catch { return init; }
+  if (!pathname.endsWith("/responses") || (init.method ?? request?.method ?? "GET").toUpperCase() !== "POST") return init;
+  const headers = new Headers(request?.headers);
+  new Headers(init.headers ?? {}).forEach((v, k) => headers.set(k, v));
+  if (headers.has("content-encoding") && headers.get("content-encoding").toLowerCase() !== "identity") return init;
+  const mediaType = headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  if (mediaType && mediaType !== "application/json" && !mediaType.endsWith("+json")) return init;
+  let text = init.body;
+  if (text == null && request) text = await readClone(request, init.signal ?? request.signal);
+  if (typeof text !== "string" || text.length > MAX_BODY || new TextEncoder().encode(text).byteLength > MAX_BODY) return init;
+  let body;
+  try { body = JSON.parse(text); } catch { return init; }
+  if (!body || typeof body !== "object" || !Array.isArray(body.input)) return init;
+  // These pointers carry context we do not have. Leave stateful requests alone,
+  // rather than silently turning a continuation into a new conversation.
+  if (body.previous_response_id || body.conversation || body.input.some(item => item?.type === "item_reference")) return init;
+  let changed = false;
+  for (const item of body.input) {
+    if (!hasInlineContent(item) || !Object.hasOwn(item, "id")) continue;
+    delete item.id;
+    if (item.type === "message" || item.type == null) {
+      // Output-message input objects require an ID. Convert to the supported
+      // EasyInputMessage form, preserving phase and every actual text segment.
+      delete item.status;
+      if (Array.isArray(item.content)) item.content = item.content.map(part =>
+        part.type === "output_text" ? { type: "input_text", text: part.text } : part);
+    }
+    changed = true;
+  }
+  // Do not change byte-identical requests that need no repair. In particular,
+  // do not claim to migrate unknown/opaque item kinds or reference-only history.
+  if (!changed) return init;
+  body.store = false;
+  for (const name of ["content-length", "content-md5", "digest", "content-digest"]) headers.delete(name);
+  return { ...init, body: JSON.stringify(body), headers };
+}

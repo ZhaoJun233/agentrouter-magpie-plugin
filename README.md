@@ -12,7 +12,7 @@
 将插件克隆至 magpie 配置卷中的本地插件目录：
 ```bash
 # 假设 magpie 配置卷挂在宿主机 $VOL（按你的实际部署路径修改）
-VOL=/path/to/magpie/config          # 例：/opt/magpie/config
+VOL=/path/to/magpie/config          # 替换为你自己的配置卷路径
 
 mkdir -p "$VOL/magpie/local-plugins"
 git clone https://github.com/ZhaoJun233/agentrouter-magpie-plugin.git "$VOL/magpie/local-plugins/agentrouter"
@@ -56,7 +56,7 @@ docker exec -it magpie magpie plugin login agentrouter
 3. 按照提示输入参数：
    - **请求端点**：直接按**回车留空**（默认 `https://agentrouter.org`，**切勿在此处填入 `sk-…` 密钥**）。
    - **站点**：回车默认选择 `agentrouter.org`。
-   - **用户名 / 密码 / Cookie / 用户ID / 自定义头**：仅需对话时**全部直接按回车跳过**；如需密码自动签到，可填入站点的用户名与独立密码。
+   - 仅需对话时跳过可选字段。GitHub 自动签到需额外配置 `githubCookie`（GitHub 登录态）和本站用户 ID；不能用 AgentRouter Cookie 代替，也不需要站点密码。
    - **API 密钥**：最后单独提示时，粘贴你的 `sk-…` 密钥。
 
 ---
@@ -102,31 +102,52 @@ docker exec magpie magpie quota agentrouter
 | **用 GitHub 登录**（推荐） | 先填系统访问令牌，再浏览器授权并复制回调地址 | 保存手填令牌，自动获取 API 密钥、session Cookie 和用户 ID；余额读取仍可能被 WAF 拦截 |
 | API 密钥 | `sk-…` | 对话、模型列表、累计消耗；不能推算剩余额度 |
 | API 密钥 + Cookie 或访问令牌 | Cookie 只填 Cookie 的值（`session=…`，多个用 `; ` 连接），同时填用户 ID；或有效访问令牌 + 用户 ID | 尝试读取当前余额；被 WAF 拦截时降级到累计消耗 |
-| API 密钥 + 站点用户名密码 | 站点账号密码，GitHub 密码不能代替 | 登录签到，并尝试从登录响应读取当前余额 |
+| API 密钥 + GitHub 登录态 | `githubCookie` 与本站用户 ID | 重新 GitHub OAuth 登录签到；会话过期/授权确认需人工处理 |
+| 站点用户名密码（旧版兼容） | 仅适用于仍开放密码登录的站点 | GitHub-only AgentRouter 用户留空 |
 
 API 密钥登录时，Cookie 和访问令牌任选其一即可。GitHub 登录需要先填写同一 AgentRouter 账号的系统访问令牌（「个人设置 → 访问令牌」），不能为空；不是 `sk-…` API 密钥，也不是 GitHub Token。Cookie 和用户 ID 由 GitHub 授权自动获取。访问令牌失效时可以继续尝试有效 Cookie；两者都不能保证通过滑动验证码。
 
-## 签到：就是登录一次
+## 签到：GitHub 重新登录
 
-这个站点**没有** `GET /api/user/checkin`。这一点是实测确认的，不是猜的：
+AgentRouter 的每日额度由**重新登录**触发，余额查询成功不等于签到。
+当前 GitHub-only 账号不能设置站点密码，旧版“先设置密码”的说明不适用。
 
-```
-/api/user/checkin  →  {"message":"无权进行此操作，权限不足"}
-/api/user/check_in →  {"message":"无权进行此操作，权限不足"}
-/api/user/foo      →  {"message":"无权进行此操作，权限不足"}
-/api/user/zzz      →  {"message":"无权进行此操作，权限不足"}
-```
+### 配置与安全边界
 
-四者**一模一样**，因为 `/api/user/checkin` 并没有对应路由，请求落到了 New API 的**管理员**路由 `/api/user/:id` 上。站点的每日额度是在**登录时**发放的 —— 登录响应带 `checked_in`，站点前端据此弹「签到成功，新增额度已到账」，后台设置项叫 `DailyCheckinQuota`。
+在账号表单的 **GitHub 登录 Cookie** 字段配置对应账号的 GitHub 登录态
+（metadata 字段名为 `githubCookie`）。支持原始 Cookie 请求头、DevTools 表格和 Cookie JSON 数组。
+它与 AgentRouter 的 `cookie` 字段不同；推理 API key、系统访问令牌、GitHub PAT/Actions token 均不能替代。
+这是高权限凭据：只保存在你信任的网关服务器，像密码一样保护，不要发到聊天、工单、截图或 Git。
+远程部署时不是“只存在本机”。如果不愿把 GitHub 会话交给网关，则不要配置此功能。
 
-所以插件把签到实现为「登录一次」：
+先在浏览器用对应 GitHub 账号登录并授权 AgentRouter，再配置完整 GitHub Cookie。
+每个账号必须填写正确的本站用户 ID，插件会校验 OAuth 返回的 ID，防止把另一个账号的结果
+记为当前账号已签到；不要把一个账号的 Cookie 复制给多个不同账号。
+注意 ID 校验发生在兑换后：填错 Cookie 可能已经登录并给那个错误账号发放额度，
+本校验只防止当前账号虚报成功，不保证消除错误账号的服务端副作用。
 
-- 有用户名密码 → `POST /api/user/login`，`checked_in: true` 记 `claimed`，`false` 记 `done`
-- 没有密码 → 返回 `ineligible`，并说明「签到就是登录一次，需要站点用户名和密码」
-- 密码错误 → `ineligible` + `signIn: expired`，不会每 30 分钟重试
-- 站点接口挂掉 → `failed`，交给 magpie 30 分钟后重试
+每次任务：获取站点配置 → 新建匿名 OAuth state/session（不带旧站点登录）→
+只向 github.com 发送 GitHub Cookie → 校验本站回调地址、state 和 code →
+兑换一次性 code → 校验账号 ID 与 `data.checked_in`。
+不跨域转发 Cookie，不轮换原有推理密钥或系统访问令牌。
 
-> 用 GitHub 登录的账号可能**没有站点密码**。要密码签到，先去站点「设置」里设一个密码。
+此轻量 HTTP 流程只支持 GitHub 对已有授权直接重定向的会话。若返回登录、授权确认、设备验证
+或 2FA 页面，会停止并要求人工处理，不自动提交表单、不绕过验证。
+浏览器可用的 Cookie 不保证服务器 HTTP 请求也能使用；若 WAF 要求浏览器执行 JS，
+需要独立持久浏览器方案，不能仅靠此字段解决。会话过期需更新，不承诺永久无人值守。
+配置后先手动点网关“签到”验证；缺少 GitHub 会话时，对话/余额查询不受影响，但不能自动签到。
+
+### 结果含义
+
+| 结果 | 证据与含义 |
+|---|---|
+| `claimed` | 匹配账号的登录响应明确返回 `data.checked_in === true`，站点确认本次新增额度 |
+| `done` | 明确返回 `false`，本次登录未新增额度；不等于证明今日曾经到账 |
+| `failed` | 网络/站点异常或缺少有效布尔签到标记，无法确认额度发放，允许重试 |
+| `ineligible` | 未配置 GitHub 会话、需要人工恢复、ID 缺失/不匹配等，需要修改账号配置 |
+
+用户名/密码字段仅为仍支持密码登录的旧站点保留；GitHub-only 用户留空。
+修改凭据后可手动签到立即验证，不必等下一天。
 
 ## 余额与累计消耗
 
@@ -174,7 +195,8 @@ AgentRouter 的网关只回应它认识的客户端 —— 白名单里是它**�
 
 - API key `sk-…`：对话、模型列表、累计消耗。
 - session Cookie / access token + 用户 ID：账号数据读取；余额可能被 WAF 拦截。
-- 站点用户名密码：登录签到，并尝试读取余额。访问令牌不能密码签到。
+- `githubCookie`：GitHub 登录会话，自动重新 OAuth 签到；高权限凭据，需妥善保护。
+- 站点用户名密码：仅兼容旧站点；GitHub-only 用户留空。
 
 `sk-` key 不能代替账号访问令牌。`/api/user/token` 会重新生成访问令牌，使旧令牌失效；插件不调用此接口，GitHub 登录直接保存你填写的系统访问令牌。
 
@@ -187,6 +209,24 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 ```
 
 所以 provider 声明为 `npm: "@ai-sdk/openai"`（Responses）。agent 发 Chat / Anthropic 请求时，由 magpie 网关负责翻译。
+
+### 跨 OpenAI 资源的历史条目错误（0.1.2）
+
+如果上游提示 `The requested item was created under a different ... OpenAI resource`，通常是请求引用了另一个资源创建的服务端条目。这不是内容敏感词，也不是改一次 API Key 就能恢复的历史。
+
+默认开启 `portable-responses`：对 `POST .../responses` 中**带完整内联内容**的普通消息和 function-call / function-call-output，去掉用于条目查找的顶层 `id`。普通输出文本转换为 API 支持的内联输入消息，保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果及嵌套业务 `id` 保持不变。有改写时设置 `store:false`，清除旧正文长度/摘要头。未改写时保留原始正文。实现见 [request.mjs](<request.mjs>)。
+
+边界：
+
+- **不删** `previous_response_id`、`conversation` 或 `item_reference`；这些请求按原样发送，因为插件并不知道它们指向的完整历史。客户端需要重发完整内联历史，或由上游固定到原资源。
+- **不删改推理及 compaction 条目**，包括它们的 ID、摘要和加密内容。`store:false` 不会让加密状态跨资源通用；不同密钥无法解密时仍须原资源。
+- 非空引用注释、未知消息字段和未知条目类型保留原样，不为修复而静默丢失内容。文件/图像/容器等资源引用也不递归删除。
+- 只处理最多 4 MiB 的 JSON 请求；读取 Request 副本最多 2 秒，支持取消。超限、非 JSON、压缩正文和其他端点不改写。不会自动重试，更不会重放用户历史。
+- 关闭提供商选项 **Replay complete Responses items inline** 可恢复原始正文透传。只有服务端引用、没有完整内联正文的旧会话，不保证仅升级插件就能继续。
+
+当此错误仍出现，插件返回 `agent_router_resource_mismatch`，保留上游消息与可识别的 trace ID，说明需要完整内联历史或同一上游资源，而不是报成敏感词错误。
+
+协议依据：[OpenAI 内联消息与 phase](<https://raw.githubusercontent.com/openai/openai-python/main/src/openai/types/responses/easy_input_message_param.py>)、[工具调用 id / call_id](<https://raw.githubusercontent.com/openai/openai-python/main/src/openai/types/responses/response_function_tool_call_param.py>)、[Azure 无存储推理延续](<https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning#preserve-reasoning-without-stored-responses>)。这些协议说明不等于厂商承诺跨资源加密状态可移植。
 
 ## 模型列表从哪来
 
@@ -296,8 +336,8 @@ magpie 识别流内错误为 429 后，可能立即换账号，再对同一账�
 
 1. 请求端点（对话与模型列表）—— 可留空，默认 `https://agentrouter.org`；**这一问只填地址**，填了 `sk-…` 会被当场拒绝并提示
 2. 站点 —— `agentrouter.org` / `ps.air-outer.com`
-3. 用户名或邮箱 —— 可留空；填了才能密码签到
-4. 密码 —— 可留空；只存本机
+3. GitHub 登录 Cookie —— 自动签到用，非本站 Cookie；用户名/密码仅旧版兼容
+4. 旧版站点用户名/密码 —— GitHub-only 账号留空；保存在网关服务器
 5. 浏览器 Cookie —— 可留空；填完整 `session=…`，不能保证通过 WAF
 6. 访问令牌 —— 可留空
 7. 用户 ID —— Cookie 或访问令牌读取账号数据时填写 `New-Api-User` 的值
@@ -339,6 +379,8 @@ magpie 识别流内错误为 429 后，可能立即换账号，再对同一账�
 
 ## 改请求头（不用重新登录）
 
+[维护脚本](<set-ar-headers.sh>)只输出固定成功提示，不回显请求头内容。但命令行参数仍可能进入 shell 历史或进程列表，因此该入口只适合非敏感客户端标识头；不要用它传入 Authorization、Cookie 或其他凭据。
+
 ```bash
 ./set-ar-headers.sh 'User-Agent: codex_cli_rs/0.101.0'
 ./set-ar-headers.sh ''          # 清空，回到默认
@@ -363,8 +405,9 @@ magpie 识别流内错误为 429 后，可能立即换账号，再对同一账�
     "metadata": {
       "endpoint": "https://agentrouter.org",
       "site": "org",
-      "username": "（密码签到时填）",
-      "password": "（只存本机）",
+      "githubCookie": "（可选：对应 GitHub 账号的完整登录 Cookie）",
+      "username": "（GitHub-only 账号留空）",
+      "password": "（GitHub-only 账号留空；保存在网关服务器）",
       "cookie": "session=…（可选，配合用户 ID）",
       "accessToken": "（可选，配合用户 ID 读账号数据）",
       "userId": "（Cookie/访问令牌读取时填）",
@@ -417,6 +460,15 @@ docker exec magpie magpie plugin options word-guard '{
    验证时要带 agent 的 User-Agent 或 `magpie-<app>` 形式的 key。
 
 它只读用户自己写的文字（user message），不读工具结果、工具调用和 system prompt。
+
+## 开发验证
+
+在仓库根目录运行：
+
+```bash
+npm test                 # Node.js 插件与本地签到回归
+npm run test:headers     # 需要 Python 3；仅执行维护脚本的 Python 部分，不调用 Docker
+```
 
 ## 文件
 

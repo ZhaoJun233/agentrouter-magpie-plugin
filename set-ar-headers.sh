@@ -6,6 +6,7 @@
 #
 # 默认改 Docker 部署常见的 <config>/magpie/plugin-auth.json，
 # 用 AUTH_FILE 覆盖；RESTART=0 可跳过自动重启。
+# 不要通过命令行传入凭据：参数可能进入 shell 历史或进程列表。
 set -e
 [ $# -eq 1 ] || { echo "用法: $0 '<每行一个 名称: 值>'"; exit 1; }
 
@@ -16,7 +17,8 @@ AUTH_FILE="${AUTH_FILE:-/opt/magpie/config/magpie/plugin-auth.json}"
 python3 -c '
 import json,io,sys
 p=sys.argv[2]
-d=json.load(io.open(p,encoding="utf-8"))
+with io.open(p,encoding="utf-8") as f:
+    d=json.load(f)
 if "agentrouter" not in d:
     sys.exit("尚未登录 agentrouter")
 h=sys.argv[1].strip()
@@ -24,8 +26,9 @@ if h:
     d["agentrouter"].setdefault("metadata",{})["headers"]=h
 else:
     d["agentrouter"].get("metadata",{}).pop("headers",None)
-io.open(p,"w",encoding="utf-8").write(json.dumps(d,ensure_ascii=False,indent=2))
-print("已写入:", h or "(清空，使用默认)")
+with io.open(p,"w",encoding="utf-8") as f:
+    f.write(json.dumps(d,ensure_ascii=False,indent=2))
+print("已更新自定义请求头" if h else "已清空自定义请求头，使用默认")
 ' "$1" "$AUTH_FILE"
 
 # 容器里以 65532 运行，改完要对得上

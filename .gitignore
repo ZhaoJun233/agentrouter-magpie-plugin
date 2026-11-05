@@ -22,3 +22,7 @@ c.json
 *.log
 .DS_Store
 Thumbs.db
+
+# Local credentials must stay outside this repository.
+github-cookie.txt
+/local-checkin-data/

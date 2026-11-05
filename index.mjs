@@ -1,4 +1,5 @@
 import { explainResponse } from "./response.mjs";
+import { prepareResponsesRequest } from "./request.mjs";
 
 // AgentRouter (agentrouter.org) for magpie / OpenCode.
 //
@@ -22,7 +23,8 @@ import { explainResponse } from "./response.mjs";
 //    credit is granted at sign-in instead (the site's login response
 //    carries checked_in, and its settings keep DailyCheckinQuota), so
 //    there is nothing for a plugin to claim after the fact. The check-in
-//    hook signs in with the site's username and password when supplied.
+//    hook can renew GitHub OAuth using an explicitly supplied GitHub session.
+//    Legacy password login remains available only for sites supporting it.
 //
 // 3. /api/user/self reports quota and used_quota, but often returns an
 //    Aliyun slider-captcha page instead. Try it with an access token or
@@ -37,7 +39,7 @@ import { explainResponse } from "./response.mjs";
 //    they spent rather than a balance — an invented one would be worse.
 //
 // Signing in with only the key is allowed. It can read consumption, but
-// cannot determine remaining credit or perform password check-in.
+// cannot determine remaining credit or renew a GitHub login for check-in.
 
 const PROVIDER = "agentrouter";
 
@@ -452,6 +454,7 @@ async function redeemGithub(base, code, state, inputs) {
       userId: String(id ?? ""),
       site: String(inputs?.site ?? "org"),
       ...(session ? { cookie: `session=${session}` } : {}),
+      ...(String(inputs?.githubCookie ?? "").trim() ? { githubCookie: String(inputs.githubCookie).trim() } : {}),
     },
   };
 }
@@ -534,8 +537,8 @@ async function signIn(provider, auth) {
       : undefined;
   if (balance) balance.total = balance.quota + balance.used;
   // `checked_in: true` means *this* sign-in granted the day's credit. A false
-  // means the day was already claimed, which is not a failure.
-  return { ok: true, checkedIn: d.checked_in === true, balance, name: d.username ?? d.display_name ?? "" };
+  // means no new grant; a missing/non-boolean marker proves nothing.
+  return { ok: true, checkedIn: d.checked_in, balance, name: d.username ?? d.display_name ?? "" };
 }
 
 // Try the read-only user endpoint first, then password sign-in. Preserve
@@ -703,28 +706,127 @@ async function usageOf(getAuth, provider) {
   };
 }
 
+// A completed login and a confirmed reward are different results.
+function checkinResult(checkedIn) {
+  if (checkedIn === true) return { outcome: "claimed", message: "AgentRouter：站点确认本次登录签到成功，新增额度已到账" };
+  if (checkedIn === false) return { outcome: "done", message: "AgentRouter：已完成登录，站点返回本次未新增签到额度（checked_in=false）" };
+  return { outcome: "failed", message: "AgentRouter：登录成功但站点未返回有效签到标记，无法确认额度发放" };
+}
+
+// GitHub's session is NOT the AgentRouter session. Start a fresh OAuth login
+// without the old site's identity; otherwise New API may bind instead of login.
+// No automatic redirects, form submissions, or forwarding cookies across sites.
+async function githubCheckin(provider, auth, cookieText) {
+  const expectedId = userId(auth);
+  if (!/^[1-9][0-9]*$/.test(expectedId)) {
+    return { outcome: "ineligible", message: "AgentRouter：GitHub 自动签到需要本站用户 ID，以校验登录账号" };
+  }
+  let rawCookie = cookieText;
+  try {
+    const exported = JSON.parse(cookieText);
+    if (Array.isArray(exported)) {
+      rawCookie = exported.filter(c => c && (!c.domain || c.domain === "github.com" || c.domain === ".github.com"))
+        .map(c => c.name + "=" + c.value).join("; ");
+    }
+  } catch { /* A raw Cookie header or devtools table is also accepted. */ }
+  const githubCookie = parseCookies(rawCookie);
+  if (/[\r\n]/.test(githubCookie) || !/(?:^|;\s*)(?:user_session|__Host-user_session_same_site)=[^;\s]+/.test(githubCookie)) {
+    return { outcome: "ineligible", message: "AgentRouter：请提供包含 user_session 的 GitHub 登录 Cookie；站点 Cookie 和访问令牌不能替代它" };
+  }
+  const manual = { outcome: "ineligible", message: "AgentRouter：GitHub 登录态失效或需要授权/二次验证；请在浏览器完成 GitHub 登录并更新 githubCookie" };
+  let stage = "获取站点配置";
+  try {
+    const base = new URL(siteBase(provider, auth));
+    if (base.protocol !== "https:" || base.username || base.password || base.pathname !== "/" || base.search || base.hash) {
+      return { outcome: "ineligible", message: "AgentRouter：自动签到要求可信的 HTTPS 站点根地址" };
+    }
+    const signal = withTimeout(REQUEST_TIMEOUT);
+    const publicHeaders = { Accept: "application/json", "User-Agent": "Mozilla/5.0" };
+    const siteJSON = async (path, cookie = "") => {
+      const response = await fetch(base.origin + path, {
+        headers: { ...publicHeaders, ...(cookie ? { Cookie: cookie } : {}) },
+        redirect: "manual", signal,
+      });
+      if (!response.ok) throw new Error("site-http");
+      const payload = await response.json();
+      if (payload?.success !== true) throw new Error("site-rejected");
+      return { payload, cookie: sessionOf(response) };
+    };
+    const { payload: config } = await siteJSON("/api/status");
+    if (!config.data?.github_oauth || !config.data?.github_client_id) {
+      return { outcome: "ineligible", message: "AgentRouter：当前站点未启用 GitHub OAuth" };
+    }
+    stage = "建立 OAuth 登录状态";
+    const { payload: init, cookie: stateCookie } = await siteJSON("/api/oauth/state?mode=login");
+    if (typeof init.data !== "string" || !init.data || !stateCookie) throw new Error("no-state");
+    const state = init.data;
+    let url = new URL("https://github.com/login/oauth/authorize");
+    url.search = new URLSearchParams({client_id: String(config.data.github_client_id), state, scope: "user:email"}).toString();
+    stage = "GitHub 重新授权";
+    let callback;
+    for (let hops = 0; hops < 5; hops++) {
+      const response = await fetch(url.href, {
+        headers: { Accept: "text/html", "User-Agent": "Mozilla/5.0", Cookie: githubCookie },
+        redirect: "manual", signal,
+      });
+      if (response.status === 200) return manual;
+      if (![301, 302, 303, 307, 308].includes(response.status)) throw new Error("github-http");
+      const location = response.headers.get("location");
+      if (!location) throw new Error("no-location");
+      const next = new URL(location, url);
+      if (next.protocol !== "https:" || next.username || next.password || next.hash) throw new Error("unsafe-location");
+      if (next.origin === base.origin) {
+        if (next.pathname !== "/oauth/github" || next.searchParams.get("state") !== state || !next.searchParams.get("code")) {
+          throw new Error("invalid-callback");
+        }
+        callback = next;
+        break;
+      }
+      if (next.origin !== "https://github.com") throw new Error("unexpected-origin");
+      if (next.pathname !== "/login/oauth/authorize") return manual;
+      if (next.searchParams.get("client_id") !== String(config.data.github_client_id) || next.searchParams.get("state") !== state) {
+        throw new Error("changed-oauth-request");
+      }
+      url = next;
+    }
+    if (!callback) throw new Error("redirect-limit");
+    stage = "兑换 OAuth 登录结果";
+    const query = new URLSearchParams({code: callback.searchParams.get("code"), state, mode: "login"});
+    const { payload: login } = await siteJSON("/api/oauth/github?" + query, "session=" + stateCookie);
+    if (String(login.data?.id ?? "") !== expectedId || login.message === "bind") {
+      return { outcome: "ineligible", message: "AgentRouter：GitHub 登录结果与当前账号用户 ID 不符，未将当前账号标记为已签到；请核对每个账号的 githubCookie" };
+    }
+    return checkinResult(login.data?.checked_in);
+  } catch {
+    // Exception text can contain cookies or one-time codes; never echo it.
+    return { outcome: "failed", message: "AgentRouter：" + stage + "失败（网络、站点响应或验证码异常），未确认签到，稍后重试" };
+  }
+}
+
 // checkinOf claims the day's credit the only way this site grants one: by
 // signing in. The site has no /api/user/checkin — that path falls through to
 // New API's admin route /api/user/:id and answers every ordinary account
 // "权限不足", the same as /api/user/foo would — and its front end says
 // "签到成功，新增额度已到账" when a login response carries checked_in. So
-// signing in *is* the check-in, and the account needs the site password for
-// it, not the access token.
+// signing in *is* the check-in. GitHub-only accounts need a GitHub session;
+// their site access token or site session cannot repeat the OAuth login.
 //
 // What comes back is `claimed` when this sign-in granted the day, and `done`
-// when the day was already granted, which is what a second run reports. A
+// when the site explicitly reports no new grant (not proof of an earlier one). A
 // wrong password is the account's to fix and settles for the day; a site
 // that is down is retried, as magpie retries any `failed`.
 async function checkinOf(getAuth, provider) {
   const auth = await getAuth();
   if (!auth) return { outcome: "failed", message: "AgentRouter：尚未登录" };
+  const githubCookie = String(meta(auth, "githubCookie") ?? "").trim();
+  if (githubCookie) return githubCheckin(provider, auth, githubCookie);
   const r = await signIn(provider, auth);
   if (!r.ok) {
     if (r.why === "no-password") {
       return {
         outcome: "ineligible",
         message:
-          "AgentRouter：签到就是登录一次，需要在账号里填站点用户名和密码（个人设置 → 账号密码），访问令牌不能签到",
+          "AgentRouter：GitHub 自动签到需要额外配置 githubCookie（GitHub 登录态）；现有站点 Cookie/访问令牌不能重新完成 GitHub 登录",
       };
     }
     if (r.why === "bad-password") {
@@ -739,10 +841,7 @@ async function checkinOf(getAuth, provider) {
     }
     return { outcome: "failed", message: `AgentRouter：登录失败（${r.why}）` };
   }
-  if (r.checkedIn) {
-    return { outcome: "claimed", message: "AgentRouter：已通过登录完成签到，新增额度已到账" };
-  }
-  return { outcome: "done", message: "AgentRouter：今日额度已发放（登录时由站点自动完成）" };
+  return checkinResult(r.checkedIn);
 }
 
 // declaredModels is the models this plugin vouches for, in the shape magpie
@@ -798,6 +897,7 @@ export const AgentRouterAuthPlugin = async (input) => {
   // 请求头"). Reading it through a closure keeps headersOf's own signature —
   // provider and account — which every caller already passes.
   codexHeaders = () => input?.magpie?.option?.(PROVIDER, "send-codex-headers") !== false;
+  const portableResponses = () => input?.magpie?.option?.(PROVIDER, "portable-responses") !== false;
   return {
     // The provider before anyone signs in: the models the vendor serves, so the
     // row has something to show, and the shape each listed one takes.
@@ -853,16 +953,22 @@ export const AgentRouterAuthPlugin = async (input) => {
               ],
             },
             {
+              type: "password",
+              key: "githubCookie",
+              message: "GitHub 登录 Cookie（可选，自动签到；高权限凭据，仅保存到你信任的网关）",
+              placeholder: "GitHub 的完整 Cookie（非 AgentRouter session）；留空不自动签到",
+            },
+            {
               type: "text",
               key: "username",
-              message: "站点用户名或邮箱（签到＝登录一次，需要账号密码）",
-              placeholder: "留空则不签到，对话仍可用",
+              message: "旧版兼容：站点用户名（GitHub-only 账号留空）",
+              placeholder: "AgentRouter GitHub 账号无需填写",
             },
             {
               type: "text",
               key: "password",
-              message: "站点密码（只存在本机，用于登录签到与读取余额）",
-              placeholder: "用 GitHub 登录的账号请先在站点设置密码",
+              message: "旧版兼容：站点密码（仅支持密码登录的站点适用；保存在网关服务器）",
+              placeholder: "AgentRouter GitHub 账号留空，不需要也不能在这里设置密码",
             },
             {
               type: "text",
@@ -949,6 +1055,12 @@ export const AgentRouterAuthPlugin = async (input) => {
               placeholder: "粘贴系统访问令牌，用于查询账号额度",
             },
             {
+              type: "password",
+              key: "githubCookie",
+              message: "GitHub 登录 Cookie（可选，自动签到；高权限凭据，仅保存到你信任的网关）",
+              placeholder: "GitHub 的完整 Cookie（非 AgentRouter session）；留空不自动签到",
+            },
+            {
               type: "select",
               key: "site",
               message: "站点",
@@ -961,9 +1073,9 @@ export const AgentRouterAuthPlugin = async (input) => {
         },
       ],
 
-      // Leave the request body as the gateway wrote it. Normalize known early
-      // failures even when the vendor puts them inside an HTTP 200 stream;
-      // response.mjs preserves successful bytes and never retries a request.
+      // Inline replay avoids resource-local item lookups when complete contents
+      // are present. Server-only references and unknown kinds stay untouched.
+      // Response normalization preserves successful bytes and never retries.
       async loader(getAuth, provider) {
         const auth = await getAuth();
         if (!auth) return {};
@@ -977,7 +1089,9 @@ export const AgentRouterAuthPlugin = async (input) => {
             new Headers(init.headers ?? {}).forEach((v, k) => h.set(k, v));
             applyHeaders(h, headersOf(provider, auth));
             if (key) h.set("Authorization", `Bearer ${key}`);
-            return explainResponse(await fetch(input, { ...init, headers: h }));
+            const requestInit = { ...init, headers: h };
+            const prepared = portableResponses() ? await prepareResponsesRequest(input, requestInit) : requestInit;
+            return explainResponse(await fetch(input, prepared));
           },
         };
       },
@@ -987,6 +1101,12 @@ export const AgentRouterAuthPlugin = async (input) => {
 
       // Switches the user can turn on the provider's editor.
       options: [
+        {
+          key: "portable-responses",
+          label: "Replay complete Responses items inline",
+          description: "Remove resource-local IDs only when inline content is available; preserve call_id and encrypted content. Reference-only history still requires the original resource. Off preserves the original request body.",
+          default: true,
+        },
         {
           key: "send-codex-headers",
           label: "Send the Codex client headers",

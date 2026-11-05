@@ -32,18 +32,22 @@ function failureResponse(value, originalHeaders) {
   const message = typeof e.message === "string" ? e.message : "";
   const capped = TOKEN_RATE_LIMIT.test(message);
   const blocked = e.code === "content-blocked";
-  if (!capped && !blocked) return null;
+  const foreignItem = /requested item was created under a different[^.]{0,100}OpenAI resource/i.test(message);
+  if (!capped && !blocked && !foreignItem) return null;
   const headers = changedHeaders(originalHeaders);
   if (capped && !headers.has("retry-after")) headers.set("retry-after", "60");
   const model = /requests to (\S+) for \S+/i.exec(message)?.[1];
   const id = /request id:\s*([A-Za-z0-9]+)/i.exec(message)?.[1];
+  const trace = /trace_id[=:]([A-Za-z0-9_-]{1,128})/.exec(message)?.[1];
   const note = capped
     ? `AgentRouter${model ? ` 的 ${model}` : ""} 达到了上游 token 速率上限。请按 Retry-After 等待后重试；上游未提供等待时间时，插件建议一分钟后再试，不保证届时已恢复。不要立即重发同一请求。`
-    : `AgentRouter 的内容过滤器拒绝了这段请求内容${id ? ` (request id: ${id})` : ""}。请改写被拒的部分，或改用其他服务商。`;
+    : foreignItem
+      ? `AgentRouter 的 Responses 历史条目属于另一个 OpenAI 资源${trace ? ` [trace_id=${trace}]` : ""}。请由客户端重发完整内联历史（store:false），或固定到创建该条目的同一上游资源；仅有 previous_response_id / item_reference 或不兼容的加密状态时，插件不能无损恢复。未自动重试。`
+      : `AgentRouter 的内容过滤器拒绝了这段请求内容${id ? ` (request id: ${id})` : ""}。请改写被拒的部分，或改用其他服务商。`;
   return new Response(JSON.stringify({ error: {
-    code: e.code ?? (capped ? "token_rate_limit" : "content-blocked"),
+    code: e.code ?? (capped ? "token_rate_limit" : foreignItem ? "resource_mismatch" : "content-blocked"),
     message: note,
-    type: capped ? "agent_router_token_rate_limit" : "agent_router_content_blocked",
+    type: capped ? "agent_router_token_rate_limit" : foreignItem ? "agent_router_resource_mismatch" : "agent_router_content_blocked",
     upstream: message,
   } }), { status: capped ? 429 : 400, headers });
 }
