@@ -152,6 +152,29 @@ test("legacy login also reads data.checked_in", async () => {
   assert.equal(result.outcome, "claimed");
 });
 
+test("blank saved GitHub Cookies retain the legacy login fallback", async () => {
+  for (const githubCookie of [undefined, null, "", "   ", " \t\r\n "]) {
+    const metadata = { username: "legacy", ["pass" + "word"]: "test-only" };
+    for (const auth of [{ metadata, githubCookie }, { metadata: { ...metadata, githubCookie } }]) {
+      const { result, calls } = await run(auth, [() => json({ success: true, data: { id: 42, checked_in: true } })]);
+      assert.equal(result.outcome, "claimed");
+      assert.equal(calls.length, 1);
+      assert.equal(new URL(calls[0].url).pathname, "/api/user/login");
+    }
+  }
+});
+
+test("malformed saved GitHub Cookies cannot fall back to legacy credentials", async () => {
+  for (const githubCookie of [123, {}, [], "\r", "\v", " ".repeat(32 * 1024 + 1), "session=site-only"]) {
+    const metadata = { username: "legacy", ["pass" + "word"]: "test-only" };
+    for (const auth of [{ metadata, githubCookie }, { metadata: { ...metadata, githubCookie } }]) {
+      const { result, calls } = await run(auth);
+      assert.equal(result.outcome, "ineligible");
+      assert.equal(calls.length, 0);
+    }
+  }
+});
+
 test("legacy login without a reward marker is not done", async () => {
   const auth = {metadata: {username: "legacy", ["pass" + "word"]: "test-only"}};
   const {result} = await run(auth, [() => json({success: true, data: {id: 42}})]);
@@ -229,4 +252,42 @@ test("GitHub redirect loops are bounded", async () => {
   const {result,calls} = await run(account,[...start(),...Array.from({length:5},()=>redirect(location))]);
   assert.equal(result.outcome,"failed");
   assert.equal(calls.length,7);
+});
+
+test("saved GitHub Cookie validation rejects malformed data before every network call", async () => {
+  for (const cookie of [
+    "   ", "user_session=", "user_session=synthetic; logged_in=no", "user_session=synthetic\r\nX-Test: injection",
+    "Cookie: user_session=" + "x".repeat(32 * 1024),
+    JSON.stringify([{ name: "user_session", value: "synthetic\r\nX-Test: injection", domain: ".github.com" }]),
+    JSON.stringify([{ name: "user_session", value: "synthetic", domain: "github.com.evil.invalid" }]),
+  ]) {
+    for (const auth of [{ ...account, githubCookie: cookie }, { ...account, metadata: { ...account.metadata, githubCookie: cookie } }]) {
+      const { result, calls } = await run(auth);
+      assert.equal(result.outcome, "ineligible");
+      assert.equal(calls.length, 0);
+      assert.ok(!result.message.includes("synthetic"));
+    }
+  }
+});
+
+test("explicit skip ignores hidden Cookie metadata without attempting OAuth", async () => {
+  for (const auth of [
+    { ...account, githubCookieMode: "skip", githubCookie: "user_session=synthetic" },
+    { ...account, metadata: { ...account.metadata, githubCookieMode: "skip" } },
+  ]) {
+    const { result, calls } = await run(auth);
+    assert.equal(result.outcome, "ineligible");
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("saved GitHub Cookie table and header normalize to the same outgoing value", async () => {
+  for (const cookie of [
+    "Cookie: " + githubCookie,
+    "user_session\tgithub-secret\t.github.com\t/\nlogged_in\tyes\t.github.com\t/\nforeign\tsynthetic-private\tevil.invalid\t/",
+  ]) {
+    const auth = { ...account, metadata: { ...account.metadata, githubCookie: cookie } };
+    const { result } = await run(auth, [...start(), redirect(), redeem({ id: 42, checked_in: true })]);
+    assert.equal(result.outcome, "claimed");
+  }
 });

@@ -1,4 +1,5 @@
 import { redactResponsesBody } from "./content-filter.mjs";
+import { readCloneText } from "./body-inspection.mjs";
 
 // Replay complete items inline instead of asking a load-balanced resource to
 // retrieve them by an old item ID. Never remove call_id or opaque contents.
@@ -6,8 +7,11 @@ function isInlinePart(part) {
   if (!part || typeof part !== "object") return false;
   if (["input_text", "input_image", "input_file", "input_audio"].includes(part.type)) return true;
   if (part.type !== "output_text" || typeof part.text !== "string") return false;
-  return Object.keys(part).every(key => ["type", "text", "annotations"].includes(key)) &&
-    (part.annotations == null || Array.isArray(part.annotations) && part.annotations.length === 0);
+  // The gateway also emits logprobs: [] on ordinary completed text. Empty
+  // probability metadata adds no content; populated or unknown data stays intact.
+  return Object.keys(part).every(key => ["type", "text", "annotations", "logprobs"].includes(key)) &&
+    (part.annotations == null || Array.isArray(part.annotations) && part.annotations.length === 0) &&
+    (!Object.hasOwn(part, "logprobs") || Array.isArray(part.logprobs) && part.logprobs.length === 0);
 }
 
 function hasInlineContent(item) {
@@ -36,35 +40,6 @@ function hasInlineContent(item) {
 
 const MAX_BODY = 4 * 1024 * 1024;
 
-async function readClone(request, signal) {
-  if (signal?.aborted) return null;
-  let reader, timer, abort;
-  try {
-    reader = request.clone().body?.getReader();
-    if (!reader) return null;
-    const stopped = new Promise((_, reject) => {
-      abort = () => reject(new Error("Request preparation stopped"));
-      timer = setTimeout(abort, 2000);
-      signal?.addEventListener("abort", abort, { once: true });
-    });
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    let bytes = 0, text = "";
-    for (;;) {
-      const { value, done } = await Promise.race([reader.read(), stopped]);
-      if (done) return text + decoder.decode();
-      bytes += value.byteLength;
-      if (bytes > MAX_BODY) return null;
-      text += decoder.decode(value, { stream: true });
-    }
-  } catch { return null; }
-  finally {
-    clearTimeout(timer);
-    if (abort) signal?.removeEventListener("abort", abort);
-    // A tee cancellation can wait for the original consumer. Never await it.
-    if (reader) void reader.cancel().catch(() => {});
-  }
-}
-
 export async function prepareResponsesRequest(input, init = {}) {
   return prepareRequest(input, init);
 }
@@ -81,7 +56,9 @@ export async function prepareRequest(input, init = {}, { portableResponses = tru
   const mediaType = headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (mediaType && mediaType !== "application/json" && !mediaType.endsWith("+json")) return init;
   let text = init.body;
-  if (text == null && request) text = await readClone(request, init.signal ?? request.signal);
+  if (text == null && request) text = await readCloneText(request, {
+    maxBytes: MAX_BODY, timeoutMs: 2000, signal: init.signal ?? request.signal,
+  });
   if (typeof text !== "string" || text.length > MAX_BODY || new TextEncoder().encode(text).byteLength > MAX_BODY) return init;
   let body;
   try { body = JSON.parse(text); } catch { return init; }

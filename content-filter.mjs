@@ -65,19 +65,44 @@ function hasContainerFence(text) {
   return text.split(/\r?\n/).some(line => codePrefix(line).containerFence);
 }
 
+// Keep structural separators with code, but leave indentation on the next
+// nonblank line for that line's own Markdown classification.
+function codeRangeWithBoundaries(text, start, end) {
+  while (start > 0 && /[ \t\r\n]/.test(text[start - 1])) start--;
+  let cursor = end;
+  while (cursor < text.length) {
+    let next = cursor;
+    while (text[next] === " " || text[next] === "\t") next++;
+    if (text[next] === "\r" && text[next + 1] === "\n") next += 2;
+    else if (text[next] === "\n") next++;
+    else break;
+    cursor = next;
+  }
+  return [start, cursor];
+}
+
 function outsideProseCode(text, replace) {
   // Collect ranges against the original text, not sliced suffixes: inline code
   // must not erase indentation, nor may indentation split a multiline code span.
   const inline = inlineCodeRanges(text);
   const protectedRanges = [...inline];
+  // A literal rule may contain the marker; protecting only matches that start
+  // with it still lets a longer rule consume a marker on a later pass.
+  for (const marker of text.matchAll(/\[FILTERED\]/g)) {
+    protectedRanges.push([marker.index, marker.index + marker[0].length]);
+  }
+  const paragraphs = text.split(/(\r?\n[ \t]*\r?\n)/);
   let position = 0, inlineIndex = 0;
-  for (const paragraph of text.split(/(\r?\n[ \t]*\r?\n)/)) {
+  for (let index = 0; index < paragraphs.length; index++) {
+    const paragraph = paragraphs[index];
     let linePosition = position;
     for (const line of paragraph.split("\n")) {
       while (inlineIndex < inline.length && inline[inlineIndex][1] <= linePosition) inlineIndex++;
       const insideInline = inlineIndex < inline.length && inline[inlineIndex][0] <= linePosition;
       if (!insideInline && line.trim() && codePrefix(line).indented) {
-        protectedRanges.push([position, position + paragraph.length]);
+        // Preserve both adjoining separators: consuming either can change the
+        // next pass's Markdown classification even without touching code bytes.
+        protectedRanges.push(codeRangeWithBoundaries(text, position, position + paragraph.length));
         break;
       }
       linePosition += line.length + 1;
@@ -103,11 +128,13 @@ function outsideCode(text, replace) {
   let position = 0, opening = null, match;
   while ((match = fences.exec(text))) {
     if (!opening) {
-      output.push(outsideProseCode(text.slice(position, match.index), replace));
-      opening = { index: match.index, marker: match[1] };
+      const start = Math.max(position, codeRangeWithBoundaries(text, match.index, match.index)[0]);
+      output.push(outsideProseCode(text.slice(position, start), replace));
+      opening = { index: start, marker: match[1] };
     } else if (match[1][0] === opening.marker[0] && match[1].length >= opening.marker.length && !match[2].trim()) {
-      output.push(text.slice(opening.index, fences.lastIndex));
-      position = fences.lastIndex;
+      const end = codeRangeWithBoundaries(text, opening.index, fences.lastIndex)[1];
+      output.push(text.slice(opening.index, end));
+      position = fences.lastIndex = end;
       opening = null;
     }
   }
@@ -167,7 +194,9 @@ export function redactResponsesBody(body, filter) {
   const redact = text => { const result = filter(text); replacements += result.replacements; return result.text; };
   const part = value => {
     if (!value || typeof value !== "object" || !["input_text", "output_text"].includes(value.type) ||
-        typeof value.text !== "string" || Object.keys(value).some(key => !["type", "text", "annotations"].includes(key)) ||
+        typeof value.text !== "string" || Object.keys(value).some(key =>
+          !["type", "text", "annotations"].includes(key) &&
+          !(value.type === "output_text" && key === "logprobs" && Array.isArray(value.logprobs) && !value.logprobs.length)) ||
         value.annotations != null && (!Array.isArray(value.annotations) || value.annotations.length)) return value;
     const text = redact(value.text);
     return text === value.text ? value : { ...value, text };

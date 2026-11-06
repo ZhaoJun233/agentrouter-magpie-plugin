@@ -162,7 +162,7 @@ test('A token-rate-limit 429 says it is a rate cap with a wait, not a spent acco
   // minute" and sending Retry-After is what a caller can act on.
   const original = globalThis.fetch;
   const capped = JSON.stringify({
-    message: 'Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.',
+    message: 'Your requests to gpt-6.1-sol for gpt-6.1-sol in example-region have exceeded token rate limit.',
     type: 'api_error',
   });
   globalThis.fetch = async () =>

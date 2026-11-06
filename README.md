@@ -2,9 +2,32 @@
 
 给 magpie 接入 [agentrouter.org](https://agentrouter.org/)：模型调用、余额与用量查询、每日自动签到，以及**可自定义请求头**。
 
+## 文档导航
+
+- [优化设计与升级指南](<docs/OPTIMIZATION.md>)：问题背景、与参考项目的取舍、兼容边界、升级/回滚与本地验证。
+- [更新日志](<CHANGELOG.md>)：0.1.5 与 0.1.4 的版本变化。
+- [本地签到说明](<LOCAL-CHECKIN.md>)：独立签到工具的使用与安全边界。
+
+> 仓库源码更新不等于 npm 发布或你的网关已升级。请按升级指南自行验证；不要把真实 Cookie、访问令牌、私有词表或抓包提交到仓库。
+
+### 0.1.5 变更
+
+- JSON 错误诊断增加 **64 KiB / 2 秒** 上限；与请求改写共用不消费原始正文的限量读取模块。请求原有 **4 MiB / 2 秒** 边界不变。
+- 在明确的错误封套内识别有限的限流、繁忙及服务故障；保留业务错误优先级、上游等待头与原有错误类型，不添加重试。
+- SSE 前缀改用增量分行，覆盖 LF、CRLF、CR 及混合换行、跨块 UTF-8；正常内容、未知事件与后续错误仍逐字节透传。
+- 本地文字过滤独立识别 `output_text.logprobs: []`，无论是否开启历史内联；关闭内联时只替换正文，不删 ID 或元数据。
+- 递归错误包络、未知 SSE 数据形状、重复事件字段与 Markdown 分隔符均增加保守保护；重复过滤不再跨越已有标记或破坏代码块边界。
+- 参考 [AgentRouter-Codex-Filter](<https://github.com/alexcarterio/AgentRouter-Codex-Filter>) 的保守诊断思路，保留当前插件形态；不引入其本地代理、仪表盘、自动重试或有损历史降级。
+
+### 0.1.4 变更
+
+- GitHub 登录先选站点，系统令牌遮蔽输入；签到续期默认跳过，主动配置时才显示 GitHub Cookie 获取说明和本地格式校验。
+- 修复完整历史消息含空 `logprobs: []` 时漏掉内联重放的情况，保留工具关联、非空概率数据、引用注释和不透明状态。
+- 无法恢复仅存在于其他上游资源的历史或加密状态；这是范围受限的兼容补充，并非所有跨资源错误的通用解法。
+
 ## 🚀 快速上手 (Quick Start)
 
-只需 3 步即可完成插件安装、账号配置与客户端接入：
+按以下步骤完成插件安装、账号配置与客户端接入；上游账号、网络与宿主版本仍需分别验证：
 
 ### 1. 安装插件
 
@@ -43,11 +66,11 @@ docker exec -it magpie magpie plugin login agentrouter
 #### 方案 A：GitHub 授权登录（推荐，支持读取额度）
 适合已绑定 GitHub 的 AgentRouter 账号，可自动获取 key、用户 ID 并读取实时余额：
 1. **获取系统访问令牌**：登录 [AgentRouter 官网](https://agentrouter.org/)，点击右上角头像进入「个人设置」→「访问令牌」，复制**系统访问令牌**（注意：**不是** `sk-…` API 密钥，也**不是** GitHub Personal Access Token）。
-2. 在终端登录交互中选择 `用 GitHub 登录 AgentRouter（推荐）`。
-3. 按提示粘贴第 1 步复制的系统访问令牌。
-4. 终端会生成 GitHub 授权 URL 并在浏览器中打开；完成授权后，浏览器会跳转至 `agentrouter.org/oauth/github/magpie?...`。
-   > ⚠️ **跳转后显示「页面未找到」是正常现象**（站点在此特定子路由不会提早自动兑换授权码）。请直接从浏览器地址栏**完整复制该整条 URL**（包含 `code=…`）。
-5. 粘贴回终端回车，插件将自动完成凭据保存与登录。
+2. 选择 `用 GitHub 登录 AgentRouter（推荐）`，先选站点，再在遮蔽输入框粘贴系统访问令牌。
+3. **普通登录选“跳过”签到续期配置**，不需要复制 GitHub Cookie。只有主动选择配置时才显示 Cookie 输入与获取说明；不愿提供也可留空跳过。
+4. 随后生成 GitHub 授权 URL；浏览器未自动打开时，手动打开宿主提供的授权链接。完成授权后，浏览器会跳转至 `agentrouter.org/oauth/github/magpie?...`。
+   > ⚠️ **跳转后显示「页面未找到」是正常现象**（站点在此特定子路由不会提早自动兑换授权码）。请直接从地址栏**完整复制 URL**（包含 `code=…`），不要刷新该回调页面。
+5. 粘贴回登录交互，插件完成凭据保存。获取 Cookie 的步骤见下文；登录成功不等于已验证每日签到。
 
 #### 方案 B：API 密钥快速登录（最简，仅模型对话）
 如果仅需调用模型进行聊天/编程，无需读取余额与签到：
@@ -56,7 +79,7 @@ docker exec -it magpie magpie plugin login agentrouter
 3. 按照提示输入参数：
    - **请求端点**：直接按**回车留空**（默认 `https://agentrouter.org`，**切勿在此处填入 `sk-…` 密钥**）。
    - **站点**：回车默认选择 `agentrouter.org`。
-   - 仅需对话时跳过可选字段。GitHub 自动签到需额外配置 `githubCookie`（GitHub 登录态）和本站用户 ID；不能用 AgentRouter Cookie 代替，也不需要站点密码。
+   - 仅需对话时跳过可选字段，签到续期选“跳过”。主动选择配置后才输入 `githubCookie`（GitHub 登录态），并填写本站用户 ID；不能用 AgentRouter Cookie 代替，也不需要站点密码。
    - **API 密钥**：最后单独提示时，粘贴你的 `sk-…` 密钥。
 
 ---
@@ -114,11 +137,22 @@ AgentRouter 的每日额度由**重新登录**触发，余额查询成功不等�
 
 ### 配置与安全边界
 
-在账号表单的 **GitHub 登录 Cookie** 字段配置对应账号的 GitHub 登录态
-（metadata 字段名为 `githubCookie`）。支持原始 Cookie 请求头、DevTools 表格和 Cookie JSON 数组。
+登录时先选择是否配置签到续期（`githubCookieMode`），默认优先选择跳过；仅选择配置才显示 **GitHub 登录 Cookie** 字段
+（metadata 字段名为 `githubCookie`）。支持 Cookie 值、单个 `Cookie:` 前缀、DevTools 表格和 Cookie JSON 数组。
 它与 AgentRouter 的 `cookie` 字段不同；推理 API key、系统访问令牌、GitHub PAT/Actions token 均不能替代。
 这是高权限凭据：只保存在你信任的网关服务器，像密码一样保护，不要发到聊天、工单、截图或 Git。
 远程部署时不是“只存在本机”。如果不愿把 GitHub 会话交给网关，则不要配置此功能。
+
+#### 如何取得 GitHub Cookie
+
+1. 在自己的浏览器打开 [github.com](https://github.com/)，登录与 AgentRouter 绑定的同一 GitHub 账号。
+2. 打开开发者工具 → **Network / 网络**，刷新页面，选中发往 `github.com` 的页面请求。
+3. 在 **Request Headers / 请求标头** 中找到 **Cookie**，只复制其值并粘贴回插件；不要复制 `Set-Cookie`、整份请求标头或 AgentRouter 的 Cookie。
+4. 不需要运行控制台脚本；`document.cookie` 读不到完整的 HttpOnly 登录 Cookie。插件不能替你读取浏览器或剪贴板。
+
+找不到或不愿提供时，返回选择跳过，或让可选 Cookie 字段留空。非空输入会在授权前进行本地格式检查：需要有效的 GitHub 登录 Cookie 名，最多 32 KiB（UTF-8）。格式通过**不代表**登录态未过期或账号匹配，不会为验证格式发送网络请求。
+
+显式跳过会清除本次隐藏字段中的 Cookie 残留；旧调用未提供新选择字段时，仍兼容合法 `githubCookie`，已有账号无需迁移。若宿主不支持条件问题，请保持 Cookie 字段留空以跳过。
 
 先在浏览器用对应 GitHub 账号登录并授权 AgentRouter，再配置完整 GitHub Cookie。
 每个账号必须填写正确的本站用户 ID，插件会校验 OAuth 返回的 ID，防止把另一个账号的结果
@@ -179,11 +213,12 @@ AgentRouter 的网关只回应它认识的客户端 —— 白名单里是它**�
 
 **这条只管模型网关**（`/v1/models`、`/v1/responses`）。站点自己的路由（`/api/...`）不看这个头，浏览器 UA 也一样能用；反过来，`codex_cli_rs` 也不会帮忙过滑动验证码。
 
-所以请求头在这里不是装饰，是**决定成败**的东西。插件默认发 Codex CLI 的头，并且允许你在三处覆盖：
+所以请求头在这里不是装饰，是**决定成败**的东西。插件默认发 Codex CLI 的头，可通过开关和以下配置层控制：
 
 - **开关**（provider 编辑器里的 `Send the Codex client headers`）：默认开。关掉后不再发默认的 Codex 标识，只发你自己给的头 —— 适合你已经有别的可用标识时。
-- **provider 级**：`providers.json` 里该 provider 的 `headers`
-- **账号级**：登录时填的 `headers`（覆盖 provider 级）
+- **模型配置层**：宿主传入的 `provider.models[*].headers` 对象（provider 编辑器可在模型配置中保存这些头）
+- **provider 级**：宿主传入的 `provider.headers` 多行文本，覆盖模型配置层
+- **账号级**：登录时填的 `headers`（保存为 `metadata.headers`），覆盖前述配置层
 
 格式是「一行一个 `Name: value`」，空行和 `#` 开头跳过。这里**只适合放这种头**：不要整段粘贴浏览器 devtools 的请求头 —— `Cookie` 有专门的一问，`Authorization` 由插件按 key/令牌设置，而 `User-Agent` 应该填**网关认的客户端标识**，不是浏览器的那一长串。
 
@@ -215,6 +250,8 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 如果上游提示 `The requested item was created under a different ... OpenAI resource`，通常是请求引用了另一个资源创建的服务端条目。这不是内容敏感词，也不是改一次 API Key 就能恢复的历史。
 
 默认开启 `portable-responses`：对 `POST .../responses` 中**带完整内联内容**的普通消息和 function-call / function-call-output，去掉用于条目查找的顶层 `id`。普通输出文本转换为 API 支持的内联输入消息，保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果及嵌套业务 `id` 保持不变。有改写时设置 `store:false`，清除旧正文长度/摘要头。未改写时保留原始正文。实现见 [request.mjs](<request.mjs>)。
+
+0.1.4 额外识别普通 `output_text` 中的空 `logprobs: []`（网关可能随完成消息一起输出）。空概率数组没有内容信息，转换为内联输入文本时可以去掉；**非空、`null` 或形状未知的概率数据保持原样**。这类完整消息的顶层 ID 曾因该字段未被识别而保留，合成资源切换回归覆盖了此缺口。
 
 边界：
 
@@ -274,23 +311,13 @@ AgentRouter 在模型前面挂了自己的**内容过滤器**。它拒绝一段�
 
 ### 为什么它会被误当成 429
 
-magpie 判断「换一个服务商是否可能成功」时，会在错误体里匹配额度/限流类词
-（`internal/gateway/fallback.go` 的 `retryable` / `quotaWords`）。被拒的 400 一旦读起来
-像限流，magpie 就会**在多个账号上重试、再故障转移到别的服务商**——最后落在 Codex 上，
-而 Codex 额度耗尽，于是看到的是 **`429 Codex: The usage limit has been reached`**。
+部分宿主会根据错误文案中的额度/限流类词判断是否切换账号或服务商。
+当内容拒绝被误归类为可重试错误时，可能触发重试或故障转移；最终展示的错误也可能来自另一上游。
+这只是一种可能的级联路径，**不能据此断言所有 429 都由内容拒绝引起**，应结合实际状态、错误代码和请求 ID 核验。
 
-这正是「AgentRouter 429 限流」的真实来源：根因是内容被拒，429 是级联产物。
-
-插件现在的做法：把这种拒绝改写为明确说明，且**措辞里不含任何额度/限流类词**
-（有测试守着这一条），于是 magpie 不再重试、不再转移。状态码保持 400，厂商的
-`code` 与 `request id` 都保留，方便报障。
-
-修复前后同一个被拒请求：
-
-| | 状态 | magpie `tries` | 最终落到 |
-|---|---|---|---|
-| 修复前 | 400 → 重试 → 转移 | 5 | Codex 的 **429** |
-| 修复后 | **400**，就地说明 | — | AgentRouter 自己 |
+插件把明确的内容拒绝改写为专用说明，避免在说明中混入额度/限流类词（由回归测试约束）。
+状态码保持 400，上游代码与请求 ID 保留，便于报障；是否重试或故障转移仍由宿主策略决定。
+插件自身不会为此多发送请求。
 
 > 遇到这个 400：保留 request id，向服务商核实拒绝原因。只有明确需要替换的文本才加入下方词表；不要盲目重试或把可疑词猜测当成已证实结论。过滤后仍可能被拒。
 
@@ -311,7 +338,7 @@ magpie 判断「换一个服务商是否可能成功」时，会在错误体里�
 行为与边界：
 
 - 仅处理 `POST .../responses` 的 `instructions`、字符串 `input`，以及 `input` 中普通 user/assistant/system/developer 消息的文本片段。Chat/Anthropic 客户端请求须先由 magpie 翻译为 Responses。`/responses/compact` 等其他端点不处理。
-- 默认区分大小写；`caseSensitive:false` 可忽略大小写。按最长字面量优先、非重叠替换成 `[FILTERED]`，不递归替换生成的标记，不自动添加单词边界。短词可能命中更长词的一部分，配置前应自行评估。
+- 默认区分大小写；`caseSensitive:false` 可忽略大小写。按最长字面量优先、非重叠替换成 `[FILTERED]`，不递归替换生成的标记，不自动添加单词边界。跨越已有过滤标记或代码块结构分隔符的词条匹配会被保守跳过，避免再次过滤时改变代码边界；普通正文中的跨段落字面量仍可整体替换。短词可能命中更长词的一部分，配置前应自行评估。
 - **不改**工具调用参数、工具结果、工具 schema、业务 ID、模型名、metadata、文件/图片、推理/compaction/加密状态和服务端历史引用。Markdown 行内代码、根级反引号/波浪线围栏和未闭合代码段保守保留。含缩进代码的段落不改，但其前后独立段落仍可过滤；遇到引用/列表容器中的围栏，为避免误判结束位置，整个文本字段不改。带引用注释或未知字段的片段也不改。它不是通用的密钥防泄漏或数据防泄漏系统，不能保证屏蔽上述范围里的词。
 - 仅匹配可见的普通正文；保留被跳过内容可能意味着上游仍会拒绝。并非找到了厂商完整词表，也不保证对某次 `content-blocked` 有效。
 - 没有命中时，不因过滤而重新序列化请求；有命中时仅替换发送副本，清理旧长度/摘要头，不回写本地历史。独立的 `portable-responses` 选项仍可执行 ID 兼容处理。
@@ -320,12 +347,14 @@ magpie 判断「换一个服务商是否可能成功」时，会在错误体里�
 
 实现：[content-filter.mjs](<content-filter.mjs>)；回归测试：[content-filter.test.mjs](<content-filter.test.mjs>)。
 
+0.1.5 的文字过滤也接受普通 `output_text` 中的空 `logprobs: []`。过滤先于历史内联执行，因此开启或关闭内联都适用；关闭内联时保留原消息 ID、`output_text` 类型、空概率数组及注释。非空、`null`、形状未知的概率数据，以及未知字段、真实注释或签名仍原样保留。`input_text` 中的未知概率字段不会因此获得放行资格。
+
 ## 真正的 429：每分钟 token 上限
 
-除了上面的内容拒绝，AgentRouter 确实会真的回 **429**，原文是：
+除了上面的内容拒绝，上游也可能报告真实的 token 速率限制。以下为**脱敏后的错误示例**，区域名仅作占位：
 
 ```json
-{"message":"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.","type":"api_error"}
+{"message":"Your requests to gpt-6.1-sol for gpt-6.1-sol in example-region have exceeded token rate limit.","type":"api_error"}
 ```
 
 这是上游明确报告的 **token 速率上限**，不能据此断言账号余额用尽。厂商没有给出
@@ -344,7 +373,7 @@ magpie 识别流内错误为 429 后，可能立即换账号，再对同一账�
   转成 **HTTP 429**；明确的内容拒绝转成 400。支持嵌套 JSON 错误及 HTTP 200 JSON 错误信封。
 - **保留上游 `Retry-After` 和 request-id**；仅对已识别的 token 速率错误，在上游没有
   给出等待时间时补 `Retry-After: 60`。60 秒是保守建议，**不保证一分钟后恢复**。
-  magpie 对超过 8 秒的等待不再做秒级同账号重试；跨账号调度仍由宿主决定。
+  宿主是否遵循等待提示、短间隔重试或跨账号调度，取决于其版本与配置；插件不保证某个等待阈值会关闭重试。
 - `response.completed` 明确给出空 `output`、输入/输出用量均为零且此前无有效输出时，
   单独报 **502 `agent_router_empty_response`**，不会伪装成限流。
 - 正常响应逐字节透传。已有正文、推理或工具调用后的错误不重新包装，避免丢失部分输出
@@ -355,13 +384,32 @@ magpie 识别流内错误为 429 后，可能立即换账号，再对同一账�
 > 看到这个 429：遵循等待提示，降低并发并评估上下文大小。如果持续发生，应向上游提供
 > request-id 查询真实阈值。插件修复的是错误识别与退避信息，不会增加上游可用容量。
 
+## 有界响应诊断与增量 SSE（0.1.5）
+
+JSON 仅在 HTTP **200 / 400 / 429** 时检查副本，最多 **64 KiB / 2 秒**；检查的是实际 UTF-8 字节，不信任 `Content-Length`。超限、超时、错误编码、读取失败或非 JSON 时放弃诊断，保留原响应供调用方读取。该上限约束诊断工作量，不限制整段正常回复，也无法阻止上游一次分配更大的单个数据块。共享实现见 [body-inspection.mjs](<body-inspection.mjs>)。
+
+只从明确的 `error`、`response.error`、SSE `event:error` 等错误封套读取最多四层嵌套的 `message` / `msg`，也支持其中 JSON 编码的错误。**不会扫描成功正文、工具结果或普通文字来猜错误**。无法识别的错误原样透传。每一层嵌套都先验证有效错误叶子，再继承有效数字状态；不借用包装层正文。预算耗尽且仍有未检查的嵌套时也原样放行，不根据已读取的祖先字段猜测。新增归类如下：
+
+| 明确的上游错误依据 | HTTP 状态 | 插件类型 |
+| --- | --- | --- |
+| 数值或严格三位数字字符串 `429`，或 `rate_limit_exceeded` | 429 | `agent_router_upstream_rate_limit` |
+| `overloaded_error`、`high_demand`，或错误消息中的完整短语 `currently experiencing high demand` | 503 | `agent_router_upstream_busy` |
+| `server_error` | 500 | `agent_router_upstream_error` |
+| 数值或严格三位数字字符串 `500` / `502` / `503` / `504` | 保留对应状态 | `agent_router_upstream_error` |
+
+当封套同时包含可识别的数值状态和错误代码时，以状态为准；类型按限流、繁忙、服务故障区分。认证、权限、余额、配额和内容策略等明确业务错误优先，**不会被包装为暂时性服务故障**。已有 token 限流、内容拦截、跨资源历史与空输出的专用类型不变。
+
+改写后的响应保留上游代码与消息（`error.code` / `error.upstream`）、request-id，以及 `Retry-After`（包括 HTTP 日期）和上游毫秒等待头；仅清除失效的正文长度、编码和摘要头。新增归类不自造重试时长。调用是否重试由宿主决定，插件不会多发一次 POST、切换账号或降级历史。
+
+SSE 仍只观察首个有效内容或未知事件之前最多 **64 KiB / 15 秒** 的前缀。增量解析兼容混合换行、注释、多行 `data:` 与跨块 UTF-8；重复 `event:` 取最后一个值，只移除冒号后的一个可选空格。已知字段内出现未知数据形状时也立即结束诊断，透传原始字节并保留取消、背压及超时中的在途读取；不发送心跳、不缓存整段回答、不观察已经放行的后续事件。相关实现见 [response.mjs](<response.mjs>)。
+
 ## 登录问答（API 密钥方式）
 
 面板或 CLI 的登录问答（**密钥最后单独问**）：
 
 1. 请求端点（对话与模型列表）—— 可留空，默认 `https://agentrouter.org`；**这一问只填地址**，填了 `sk-…` 会被当场拒绝并提示
 2. 站点 —— `agentrouter.org` / `ps.air-outer.com`
-3. GitHub 登录 Cookie —— 自动签到用，非本站 Cookie；用户名/密码仅旧版兼容
+3. 签到续期配置 —— 默认“跳过”；仅主动选择“配置”才显示 GitHub 登录 Cookie 输入（非本站 Cookie），仍可留空跳过
 4. 旧版站点用户名/密码 —— GitHub-only 账号留空；保存在网关服务器
 5. 浏览器 Cookie —— 可留空；填完整 `session=…`，不能保证通过 WAF
 6. 访问令牌 —— 可留空
@@ -414,7 +462,7 @@ magpie 识别流内错误为 429 后，可能立即换账号，再对同一账�
 脚本默认读 `<magpie 配置目录>/magpie/plugin-auth.json`（Docker 部署常见为
 `/opt/magpie/config/magpie/plugin-auth.json`），用 `AUTH_FILE` 覆盖。
 
-三层覆盖（后者覆盖前者）：插件默认 → 模型级 `headers`（面板可改）→ 账号级 `metadata.headers`。
+四层覆盖（后者覆盖前者）：插件默认 → 模型配置 `provider.models[*].headers` → provider 级 `provider.headers` → 账号级 `metadata.headers`。当前实现先按枚举顺序汇总该 provider 的模型头，同名项由后面的模型覆盖；这不是按当前请求模型隔离的设置。模型层接受对象，provider 与账号层接受上述多行文本；宿主界面名称及配置映射以其版本为准。
 
 ## 手动配置文件格式（plugin-auth.json）
 

@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { AgentRouterAuthPlugin } from './index.mjs';
 
 const encoder = new TextEncoder();
-const message = 'Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.';
+const message = 'Your requests to gpt-6-astra for gpt-6-astra in example-region have exceeded token rate limit.';
 const cap = { message, type: 'api_error' };
 const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 const fail = frame('error', cap);
@@ -11,13 +11,88 @@ const created = frame('response.created', { type: 'response.created', response: 
 const sse = (body, extra = {}) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream', ...extra } });
 async function load(response) {
   const old = globalThis.fetch;
-  globalThis.fetch = async () => response;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    assert.equal(++calls, 1, "loader must never retry an upstream request");
+    return response;
+  };
   try {
     const p = await AgentRouterAuthPlugin();
     const l = await p.auth.loader(async () => ({ key: 'sk-example' }), {});
     return await l.fetch('https://example.invalid/v1/responses', { method: 'POST', body: '{}' });
   } finally { globalThis.fetch = old; }
 }
+
+test('Whitelisted numeric upstream statuses in explicit errors replace false HTTP200 success', async () => {
+  for (const status of [429, 500, 502, 503, 504]) {
+    for (const field of ['status', 'status_code', 'code']) {
+      const error = { [field]: status, message: 'upstream fixture failure' };
+      const r = await load(sse(frame('error', { error })));
+      assert.equal(r.status, status, field + '=' + status);
+      assert.equal((await r.json()).error.type, status === 429
+        ? 'agent_router_upstream_rate_limit' : 'agent_router_upstream_error');
+      assert.equal(r.headers.get('retry-after'), null);
+    }
+  }
+});
+
+test('Whitelisted transient codes map conservatively and retain Retry-After', async () => {
+  for (const [code, status, type] of [
+    ['rate_limit_exceeded', 429, 'agent_router_upstream_rate_limit'],
+    ['server_error', 500, 'agent_router_upstream_error'],
+    ['overloaded_error', 503, 'agent_router_upstream_busy'],
+    ['high_demand', 503, 'agent_router_upstream_busy'],
+  ]) {
+    for (const field of ['code', 'type']) {
+      const r = await load(sse(frame('response.failed', { response: { error: { [field]: code, message: 'fixture error' } } }), { 'retry-after': '17' }));
+      assert.equal(r.status, status, field + '=' + code);
+      assert.equal((await r.json()).error.type, type);
+      assert.equal(r.headers.get('retry-after'), '17');
+    }
+  }
+});
+
+test('Business errors take precedence over transient status and wording', async () => {
+  for (const business of [
+    { code: 'invalid_api_key' }, { type: 'authentication_error' }, { code: 'permission_denied' },
+    { type: 'insufficient_quota' }, { code: 'insufficient_balance' }, { code: 'content_policy_violation' },
+    { message: 'Your account balance is insufficient' }, { message: 'Daily quota exceeded' },
+  ]) {
+    const error = { status: 429, code: 'server_error', message: 'fixture error', ...business };
+    const text = frame('error', { error });
+    const r = await load(sse(text));
+    assert.equal(r.status, 200, JSON.stringify(business));
+    assert.equal(await r.text(), text);
+  }
+});
+
+test('Nested error envelopes retain outer status and veto business markers at every layer', async () => {
+  const transient = { status: 503, error: { message: 'fixture upstream failed' } };
+  for (const response of [sse(frame('error', transient)), new Response(JSON.stringify(transient), { headers: { 'content-type': 'application/json' } })]) {
+    const r = await load(response);
+    assert.equal(r.status, 503);
+    assert.equal((await r.json()).error.type, 'agent_router_upstream_error');
+  }
+  for (const envelope of [
+    { code: 'insufficient_quota', error: { code: 'server_error' } },
+    { error: { code: 'insufficient_quota', message: JSON.stringify({ code: 'server_error', message: 'fixture' }) } },
+    { response: { error: { type: 'permission_denied', status: 503 } } },
+  ]) {
+    const text = frame('error', envelope);
+    const r = await load(sse(text));
+    assert.equal(r.status, 200);
+    assert.equal(await r.text(), text);
+  }
+});
+
+test('Unknown status, malformed numeric strings and detail-less failures stay byte-identical', async () => {
+  for (const error of [{}, { status: 200 }, { status: 418 }, { status: '429x' }, { status: ' 429' }, { status: '0503' }, { code: 'new_error' }, { message: 'busy' }]) {
+    const text = frame('error', { error });
+    const r = await load(sse(text));
+    assert.equal(r.status, 200);
+    assert.equal(await r.text(), text);
+  }
+});
 
 test('Wire HTTP200 event:error with api_error payload becomes explicit 429', async () => {
   const r = await load(sse(fail));
@@ -127,6 +202,36 @@ test('Late errors after reasoning, refusal or tool call are preserved, not retri
     assert.equal(r.status, 200);
     assert.equal(await r.text(), text);
   }
+});
+
+test('Unknown and non-text semantic events release before any later error', async () => {
+  const firstEvents = [
+    'event: unknown\n\n',
+    frame('unknown', { choices: [] }),
+    frame('unknown', { type: 'response.created', response: { output: [] } }),
+    frame('response.output_item.added', { type: 'response.output_item.added', item: { type: 'message', content: [{ type: 'output_audio', data: 'audio' }] } }),
+    frame('response.output_item.added', { type: 'response.output_item.added', item: { type: 'reasoning', encrypted_content: 'opaque' } }),
+    frame('response.content_part.added', { type: 'response.content_part.added', part: { type: 'image', url: 'https://example.invalid/image' } }),
+    frame('message', { choices: [{ delta: { audio: { data: 'audio' } } }] }),
+    frame('message', { choices: [{ delta: { future_field: 'opaque' } }] }),
+  ];
+  for (const first of firstEvents) {
+    const text = created + first + fail;
+    const r = await load(sse(text));
+    assert.equal(r.status, 200, first);
+    assert.deepEqual(new Uint8Array(await r.arrayBuffer()), encoder.encode(text));
+  }
+});
+
+test('Mixed SSE newlines, multiline data and byte-split UTF8 still classify early failure', async () => {
+  const text = ': 中文🪶\r\ndata: {"error":\rdata: {"code":"server_error","message":"fixture"}}\n\r\n';
+  const bytes = encoder.encode(text);
+  let i = 0;
+  const r = await load(sse(new ReadableStream({
+    pull(c) { if (i < bytes.length) c.enqueue(bytes.slice(i, ++i)); else c.close(); },
+  })));
+  assert.equal(r.status, 500);
+  assert.equal((await r.json()).error.type, 'agent_router_upstream_error');
 });
 
 test('Unknown errors and truncated preludes remain unchanged', async () => {

@@ -1,6 +1,7 @@
 import { explainResponse } from "./response.mjs";
 import { prepareRequest } from "./request.mjs";
 import { loadTextFilter } from "./content-filter.mjs";
+import { parseGithubCookie } from "./github-cookie.mjs";
 
 // AgentRouter (agentrouter.org) for magpie / OpenCode.
 //
@@ -323,6 +324,67 @@ async function jsonOrText(res) {
 // used here only has to survive the authorize step.
 const GITHUB_CALLBACK_PATH = "/oauth/github/magpie";
 
+// The form and check-in use the same local parser. A missing mode is a legacy
+// caller; explicit skip must erase a hidden value when Magpie merges metadata.
+function githubCookieForAuth(inputs) {
+  const mode = inputs?.githubCookieMode;
+  if (mode === "skip") return "";
+  if (mode !== undefined && mode !== "configure") {
+    throw new Error("请选择跳过或配置 GitHub 自动签到");
+  }
+  const parsed = parseGithubCookie(inputs?.githubCookie);
+  if (parsed.error) throw new Error(parsed.error);
+  return parsed.cookie;
+}
+
+function githubCookiePrompts() {
+  return [
+    {
+      type: "select",
+      key: "githubCookieMode",
+      message: "是否配置 GitHub 签到续期？跳过不影响普通登录和 API 调用，可稍后配置",
+      options: [
+        { label: "跳过，暂不配置（推荐）", value: "skip" },
+        { label: "配置 GitHub Cookie", value: "configure" },
+      ],
+    },
+    {
+      type: "password",
+      key: "githubCookie",
+      when: { key: "githubCookieMode", op: "eq", value: "configure" },
+      message: "GitHub 登录 Cookie（可选，可留空放弃配置）\n" +
+        "1. 在自己的浏览器打开 https://github.com，登录与 AgentRouter 绑定的同一 GitHub 账号。\n" +
+        "2. 打开开发者工具 → Network/网络，刷新页面，选择发往 github.com 的页面请求。\n" +
+        "3. 在 Request Headers/请求标头中找到 Cookie，只复制其值回到这里粘贴；不要复制 Set-Cookie、整份标头或 AgentRouter Cookie。\n" +
+        "4. 无需运行控制台脚本；document.cookie 无法取得完整的 HttpOnly 登录 Cookie。\n" +
+        "这是高权限凭证，会提交并保存到自己的网关，仅在可信网关使用。勿发到聊天、截图、日志或公共仓库。插件不能自动读取浏览器或剪贴板，也不能自动弹出 Cookie 获取窗口。\n" +
+        "找不到、不愿提供或暂不配置可留空或选择跳过。格式合格不代表线上有效或账号正确；Cookie 失效或需要二次验证时仍须人工更新，不保证永久自动签到。",
+      placeholder: "user_session=…; logged_in=yes（非 AgentRouter session）",
+      validate: value => parseGithubCookie(value).error,
+    },
+  ];
+}
+
+// Full callback URLs must belong to this flow. A code alone remains supported.
+function githubCallbackCode(pasted, expectedURL, state) {
+  const text = String(pasted ?? "").trim();
+  if (!text || text.length > 8192) return "";
+  if (/^[A-Za-z0-9_-]{8,2048}$/.test(text)) return text;
+  try {
+    const url = new URL(text);
+    const expected = new URL(expectedURL);
+    const params = url.searchParams;
+    if (url.origin !== expected.origin || url.pathname !== expected.pathname ||
+        url.username || url.password || url.hash || params.has("error") ||
+        params.getAll("state").length !== 1 || params.get("state") !== state ||
+        params.getAll("code").length !== 1) return "";
+    const code = params.get("code");
+    return /^[A-Za-z0-9_-]{8,2048}$/.test(code ?? "") ? code : "";
+  } catch {
+    return "";
+  }
+}
+
 // callbackUrl is where GitHub is asked to send the browser. It has to sit on
 // the origin the site's app registered — the site's own web routes, which the
 // site reports — because GitHub checks the callback's host, and the code is
@@ -425,18 +487,18 @@ async function redeemGithub(base, code, state, inputs) {
     );
     session = sessionOf(res);
     ({ json } = await jsonOrText(res));
-  } catch (e) {
-    return { type: "failed", error: `兑换授权失败：${e?.message ?? String(e)}` };
+  } catch {
+    return { type: "failed", error: "兑换 GitHub 授权失败，请检查网络后重新发起登录；不要重复使用旧授权码" };
   }
   if (!json?.success) {
-    return { type: "failed", error: String(json?.message ?? "GitHub 授权失败") };
+    return { type: "failed", error: "GitHub 授权兑换失败，授权码可能已使用或过期；请重新发起登录并复制新的完整回调地址" };
   }
   const d = json.data ?? {};
   const id = d.id ?? "";
   // Keep the explicitly entered system token; regenerating it here would
   // invalidate the token the user just supplied.
   const token = String(inputs?.accessToken ?? "").trim();
-  if (!token) return { type: "failed", error: "请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌）" };
+  if (!token) return { type: "failed", error: "请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌）后重新登录" };
 
   // The completions key is not in this answer either, so it is read with the
   // token: the account's own key list. A site that refuses leaves the key
@@ -455,7 +517,8 @@ async function redeemGithub(base, code, state, inputs) {
       userId: String(id ?? ""),
       site: String(inputs?.site ?? "org"),
       ...(session ? { cookie: `session=${session}` } : {}),
-      ...(String(inputs?.githubCookie ?? "").trim() ? { githubCookie: String(inputs.githubCookie).trim() } : {}),
+      githubCookie: inputs?.githubCookie ?? "",
+      ...(inputs?.githubCookieMode ? { githubCookieMode: inputs.githubCookieMode } : {}),
     },
   };
 }
@@ -722,18 +785,11 @@ async function githubCheckin(provider, auth, cookieText) {
   if (!/^[1-9][0-9]*$/.test(expectedId)) {
     return { outcome: "ineligible", message: "AgentRouter：GitHub 自动签到需要本站用户 ID，以校验登录账号" };
   }
-  let rawCookie = cookieText;
-  try {
-    const exported = JSON.parse(cookieText);
-    if (Array.isArray(exported)) {
-      rawCookie = exported.filter(c => c && (!c.domain || c.domain === "github.com" || c.domain === ".github.com"))
-        .map(c => c.name + "=" + c.value).join("; ");
-    }
-  } catch { /* A raw Cookie header or devtools table is also accepted. */ }
-  const githubCookie = parseCookies(rawCookie);
-  if (/[\r\n]/.test(githubCookie) || !/(?:^|;\s*)(?:user_session|__Host-user_session_same_site)=[^;\s]+/.test(githubCookie)) {
-    return { outcome: "ineligible", message: "AgentRouter：请提供包含 user_session 的 GitHub 登录 Cookie；站点 Cookie 和访问令牌不能替代它" };
+  const parsed = parseGithubCookie(cookieText);
+  if (parsed.error || !parsed.cookie) {
+    return { outcome: "ineligible", message: "AgentRouter：" + (parsed.error || "GitHub 自动签到需要 GitHub 登录 Cookie，可稍后重新配置") };
   }
+  const githubCookie = parsed.cookie;
   const manual = { outcome: "ineligible", message: "AgentRouter：GitHub 登录态失效或需要授权/二次验证；请在浏览器完成 GitHub 登录并更新 githubCookie" };
   let stage = "获取站点配置";
   try {
@@ -819,8 +875,13 @@ async function githubCheckin(provider, auth, cookieText) {
 async function checkinOf(getAuth, provider) {
   const auth = await getAuth();
   if (!auth) return { outcome: "failed", message: "AgentRouter：尚未登录" };
-  const githubCookie = String(meta(auth, "githubCookie") ?? "").trim();
-  if (githubCookie) return githubCheckin(provider, auth, githubCookie);
+  // Explicit skip wins over stale hidden Cookie metadata, including on older hosts.
+  const githubCookie = meta(auth, "githubCookieMode") === "skip" ? "" :
+    (auth.githubCookie ?? auth.metadata?.githubCookie);
+  // Only parser-recognized blanks fall back; malformed saved values must still be rejected.
+  if (parseGithubCookie(githubCookie ?? "").cookie !== "") {
+    return githubCheckin(provider, auth, githubCookie);
+  }
   const r = await signIn(provider, auth);
   if (!r.ok) {
     if (r.why === "no-password") {
@@ -954,12 +1015,7 @@ export const AgentRouterAuthPlugin = async (input) => {
                 { label: "ps.air-outer.com（备用域名）", value: "air" },
               ],
             },
-            {
-              type: "password",
-              key: "githubCookie",
-              message: "GitHub 登录 Cookie（可选，自动签到；高权限凭据，仅保存到你信任的网关）",
-              placeholder: "GitHub 的完整 Cookie（非 AgentRouter session）；留空不自动签到",
-            },
+            ...githubCookiePrompts(),
             {
               type: "text",
               key: "username",
@@ -979,15 +1035,15 @@ export const AgentRouterAuthPlugin = async (input) => {
               placeholder: "session=…",
             },
             {
-              type: "text",
+              type: "password",
               key: "accessToken",
-              message: "访问令牌（可选，站点「个人设置 → 访问令牌」；Cookie 有效时不需要）",
+              message: "系统访问令牌（可选，AgentRouter「个人设置 → 访问令牌」；不是 API Key 或 GitHub Token，本站 Cookie 有效时不需要）",
               placeholder: "留空则用浏览器 Cookie 读取余额",
             },
             {
               type: "text",
               key: "userId",
-              message: "用户 ID（New-Api-User；用 Cookie 或访问令牌读取账号数据时填写）",
+              message: "本站用户 ID（New-Api-User；API 登录配置 GitHub 自动签到或读取账号数据时需填写；GitHub 登录会自动获取）",
               placeholder: "例如 1234",
             },
             {
@@ -997,12 +1053,12 @@ export const AgentRouterAuthPlugin = async (input) => {
               placeholder: "User-Agent: codex_cli_rs/0.101.0",
             },
           ],
-          // No `authorize`: the host saves the key itself, and the answers to
-          // the prompts become the account's metadata. That is deliberate —
-          // an `authorize` here would be handed the prompts' answers *without*
-          // the key (the host passes the key beside them, not inside them), so
-          // a check written in it can only refuse a correct key. The key is
-          // checked on the first request instead, where it actually goes.
+          // Magpie falls back to the separately entered key when this result
+          // omits key. Only normalize metadata; other hosts keep native entry.
+          ...(input?.magpie ? { authorize: async (inputs) => ({
+            type: "success",
+            metadata: { ...inputs, githubCookie: githubCookieForAuth(inputs) },
+          }) } : {}),
         },
         {
           // Signing in the way the site's own "Login with GitHub" button does.
@@ -1019,6 +1075,7 @@ export const AgentRouterAuthPlugin = async (input) => {
           type: "oauth",
           label: "用 GitHub 登录 AgentRouter（推荐）",
           authorize: async (inputs) => {
+            const githubCookie = githubCookieForAuth(inputs);
             if (!String(inputs?.accessToken ?? "").trim()) {
               throw new Error("请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌，不是 API 密钥或 GitHub Token）");
             }
@@ -1036,32 +1093,23 @@ export const AgentRouterAuthPlugin = async (input) => {
             return {
               url,
               instructions:
+                "若未自动打开浏览器，请手动打开上方链接。不要刷新授权后的页面，以免一次性 code 被消耗。\n" +
                 `在打开的页面用 GitHub 登录并授权。授权后浏览器会跳到 ${cid.origin} 下的一个地址，` +
                 "它显示的是「页面未找到」——这是正常的，那一页不会用掉你的授权码。" +
-                "请把地址栏里那一整条地址（含 code=…）复制下来，回到这里粘贴。",
+                "请把地址栏里的完整地址（含 code=… 和 state=…）复制下来，回到这里粘贴；也可仅粘贴 code。\n" +
+                "这个链接只完成站点登录，不会自动读取或弹出 GitHub Cookie 获取窗口；Cookie 是以后自动签到的可选配置。\n" +
+                "授权码是一次性的；若已使用或过期失效，请重新发起登录，不要重复提交旧地址。若 GitHub 显示回调地址未注册/redirect_uri mismatch，请联系站点管理员；这不是 Cookie 或二次验证的问题。",
               method: "code",
               // The code is read from whatever the user pastes: the whole
               // callback URL, or just the code.
               callback: async (pasted) => {
-                const code = codeOf(pasted);
-                if (!code) return { type: "failed", error: "没有在粘贴的内容里找到 code" };
-                return redeemGithub(site.site, code, st.state, inputs);
+                const code = githubCallbackCode(pasted, callbackUrl(cid.origin), st.state);
+                if (!code) return { type: "failed", error: "GitHub 回调地址、state 或授权码无效，或授权已取消；请重新登录并复制完整回调地址或仅 code" };
+                return redeemGithub(site.site, code, st.state, { ...inputs, githubCookie });
               },
             };
           },
           prompts: [
-            {
-              type: "text",
-              key: "accessToken",
-              message: "系统访问令牌（必填，AgentRouter「个人设置 → 访问令牌」；不是 API 密钥或 GitHub Token）",
-              placeholder: "粘贴系统访问令牌，用于查询账号额度",
-            },
-            {
-              type: "password",
-              key: "githubCookie",
-              message: "GitHub 登录 Cookie（可选，自动签到；高权限凭据，仅保存到你信任的网关）",
-              placeholder: "GitHub 的完整 Cookie（非 AgentRouter session）；留空不自动签到",
-            },
             {
               type: "select",
               key: "site",
@@ -1071,6 +1119,13 @@ export const AgentRouterAuthPlugin = async (input) => {
                 { label: "ps.air-outer.com（备用域名）", value: "air" },
               ],
             },
+            {
+              type: "password",
+              key: "accessToken",
+              message: "系统访问令牌（必填，AgentRouter「个人设置 → 访问令牌」；不是 API 密钥或 GitHub Token）",
+              placeholder: "粘贴系统访问令牌，用于查询账号额度",
+            },
+            ...githubCookiePrompts(),
           ],
         },
       ],

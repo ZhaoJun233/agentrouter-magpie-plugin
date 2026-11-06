@@ -5,6 +5,9 @@ node_modules/
 
 # 本地凭据 —— 绝不提交
 plugin-auth.json
+plugin-auth.json.*
+.npmrc
+.netrc
 .credentials*
 .env
 .env.*
@@ -24,8 +27,24 @@ c.json
 Thumbs.db
 
 # Local credentials must stay outside this repository.
-github-cookie.txt
+github-cookie*.txt*
+cookies.txt
+cookies.txt.*
+cookies.json
+cookies.json.*
+cookies-*.json
 /local-checkin-data/
 
 # Private, user-confirmed filtering rules; never publish this file.
 content-filter.local.json
+content-filter.local.json.*
+
+# Local review/recovery evidence and captures are not publication inputs.
+.session-recovery/
+session.v*.jsonl
+agentrouter-*-verification-*/
+agentrouter-*-local-release-*/
+agentrouter-*-publication-*/
+*.har
+*.pcap
+*.pcapng
