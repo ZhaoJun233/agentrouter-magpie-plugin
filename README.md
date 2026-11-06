@@ -31,7 +31,28 @@
 
 ### 1. 安装插件
 
-#### Docker 部署（推荐）
+#### npm 包安装（固定版本）
+
+包名为 [`opencode-agentrouter-auth`](<https://www.npmjs.com/package/opencode-agentrouter-auth>)。先在 npm 官方 registry 核对目标版本，再交给 **magpie 的插件管理器**安装；仅运行 `npm install` 不会自动把插件注册到 magpie：
+
+```bash
+# 在有 Node.js / npm 的终端查询；本仓库当前版本为 0.1.5
+npm view opencode-agentrouter-auth@0.1.5 version --registry=https://registry.npmjs.org
+
+# Docker：查询成功后安装，容器名按你的实际部署修改
+docker exec magpie magpie plugin add npm:opencode-agentrouter-auth@0.1.5
+
+# 或者，本地 / 原生进程部署
+magpie plugin add npm:opencode-agentrouter-auth@0.1.5
+```
+
+- Docker 与原生进程命令二选一。安装后用 `magpie plugin list --json`（Docker 中在命令前加 `docker exec magpie`）核对插件，再在面板检查 AgentRouter 的插件选项和登录状态。
+- 如果版本查询返回 `E404`，该版本在所查 registry 尚不可用；不要把源码版本号当成 npm 已发布证明，可改用下方源码安装。若仅宿主安装失败，可运行 `magpie plugin registry` 检查它实际使用的 registry；查询命令不会替你修改宿主设置。
+- 已用本地目录安装的用户，继续更新原目录即可；不要直接再添加一份 npm 插件。先备份并确认宿主如何关联插件路径、认证及选项，再决定是否迁移，避免重复注册或丢失原配置。
+- 固定 `@0.1.5` 便于复现；省略版本会让宿主选择版本，但并不等同于更新所有插件。`magpie plugin update` 则可能更新其他插件，不作为本插件的定点升级步骤。
+- 已通过 npm 安装的用户，升级或降级前须确认当前宿主的**单包替换方式以及认证/选项保留行为**；未确认前暂停操作，不直接重复执行 `plugin add`。旧版本也须经 npm 查询确认存在，不能假设仓库旧版本都已发布。下方[升级/回滚指南](<docs/OPTIMIZATION.md#11-升级与回退>)针对本地包/目录备份，不是已验证的 npm 定点降级流程。
+
+#### Docker 源码安装
 将插件克隆至 magpie 配置卷中的本地插件目录：
 ```bash
 # 假设 magpie 配置卷挂在宿主机 $VOL（按你的实际部署路径修改）
@@ -39,13 +60,13 @@ VOL=/path/to/magpie/config          # 替换为你自己的配置卷路径
 
 mkdir -p "$VOL/magpie/local-plugins"
 git clone https://github.com/ZhaoJun233/agentrouter-magpie-plugin.git "$VOL/magpie/local-plugins/agentrouter"
-chown -R 65532:65532 "$VOL/magpie/local-plugins"   # 容器内运行用户 uid，按镜像实际情况修改
+chown -R 65532:65532 "$VOL/magpie/local-plugins/agentrouter"   # 仅修改本插件；uid/gid 按镜像实际情况修改
 
 # 在 magpie 容器中加载插件
 docker exec magpie magpie plugin add /config/magpie/local-plugins/agentrouter
 ```
 
-#### 本地 / 原生进程部署
+#### 本地 / 原生进程源码安装
 ```bash
 git clone https://github.com/ZhaoJun233/agentrouter-magpie-plugin.git
 magpie plugin add /path/to/agentrouter-magpie-plugin
