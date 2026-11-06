@@ -175,12 +175,12 @@ GitHub Cookie 是可选签到续期的高权限会话，不随升级自动采集
 
 ## 8. 历史、工具与不透明状态
 
-`portable-responses` 只处理含完整内联内容的已知普通消息、`function_call` 和 `function_call_output`，删除用于上游条目查找的顶层 `id`。普通输出消息转换为可接受的内联输入形式，保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果和嵌套业务 `id` 不动。
+`portable-responses` 只处理含完整内联内容的已知普通消息、`function_call` 和 `function_call_output`，删除用于上游条目查找的顶层 `id`。普通消息同时删除 `status`；非 assistant 的 `output_text` 转为 `input_text`，assistant 保留 `output_text`，均保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果和嵌套业务 `id` 不动。
 
 保留规则优先：
 
 - 不删除 `previous_response_id`、`conversation` 或 `item_reference`；存在这些服务端历史引用时不执行 ID 内联改写。
-- 不删改 reasoning、`encrypted_content`、compaction、摘要或未知条目；`store:false` 不会让加密状态跨资源可移植。
+- reasoning 条目降级为仅 `summary`，删除资源绑定的 `id` 与 `encrypted_content`；compaction、摘要和未知条目仍不删改。`store:false` 不会让加密状态跨资源可移植。
 - 非空引用注释、未知消息字段、文件/图像/容器等资源引用不做递归“清理”。
 - 不内置“失败后删历史再发一次”路径，不默认硬拒绝不透明历史，也不会从其他资源偷偷获取缺失上下文。
 

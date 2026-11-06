@@ -25,9 +25,9 @@ test("portable inline history does not look up IDs on a different resource", asy
   const seen = await capture(t, url, { method: "POST", body });
   const after = JSON.parse(seen.init.body);
   const expected = structuredClone(before); expected.store = false;
-  for (const item of expected.input) if (item.type !== "reasoning") delete item.id;
+  for (const item of expected.input) delete item.id;
   delete expected.input[1].status;
-  expected.input[1].content = [{ type: "input_text", text: "Checking" }];
+  expected.input[2] = { type: "reasoning", summary: [] };
   assert.deepEqual(after, expected);
   assert.deepEqual(JSON.parse(body), before);
 });
@@ -59,9 +59,12 @@ for (const state of [{ previous_response_id: "resp_remote" }, { conversation: "c
 for (const path of ["/v1/chat/completions", "/v1/responses/compact"]) test("other endpoints stay byte-identical: " + path, async t => {
   const body = JSON.stringify(history()); const seen = await capture(t, "https://agentrouter.org" + path, { method: "POST", body }); assert.equal(seen.init.body, body);
 });
-test("unknown and non-self-contained items retain every field", async t => {
+test("unknown items and compaction retain every field while reasoning is reduced", async t => {
   const before = { store: false, input: [ { type: "reasoning", id: "rs_reference", summary: [] }, { type: "future_item", id: "future_1", payload: "opaque" }, { type: "function_call", id: "fc_reference" }, { type: "compaction", id: "cmp_1", encrypted_content: "opaque" } ] };
-  const body = JSON.stringify(before); const seen = await capture(t, url, { method: "POST", body }); assert.equal(seen.init.body, body);
+  const body = JSON.stringify(before); const seen = await capture(t, url, { method: "POST", body });
+  assert.deepEqual(JSON.parse(seen.init.body), { store: false, input: [
+    { type: "reasoning", summary: [] }, before.input[1], before.input[2], before.input[3],
+  ] });
 });
 test("GET, malformed JSON and encoded bodies stay untouched", async t => {
   const old = globalThis.fetch; t.after(() => { globalThis.fetch = old; }); const seen=[];
@@ -82,10 +85,11 @@ test("resource rejection is actionable and never automatically retried", async t
   assert.match(data.error.message, /trace_id=test-trace/);
 });
 
-test("annotated messages and opaque reasoning remain intact", async t => {
+test("annotated messages stay intact while opaque reasoning is reduced", async t => {
   const items = [ { type: "message", id: "msg_cited", role: "assistant", content: [{ type: "output_text", text: "Source", annotations: [{ type: "url_citation", url: "https://example.org" }] }] }, { type: "reasoning", id: "rs_sealed", summary: [], encrypted_content: "sealed" } ];
   const body = JSON.stringify({ store: true, input: items });
-  const seen = await capture(t, url, { method: "POST", body }); assert.equal(seen.init.body, body);
+  const seen = await capture(t, url, { method: "POST", body });
+  assert.deepEqual(JSON.parse(seen.init.body), { store: false, input: [items[0], { type: "reasoning", summary: [] }] });
 });
 test("over-limit and explicitly non-JSON bodies are not rewritten", async t => {
   const body = JSON.stringify({ ...history(), extra: "x".repeat(4 * 1024 * 1024) });

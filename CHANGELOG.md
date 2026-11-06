@@ -4,6 +4,10 @@
 
 本页记录源码行为，当前版本为 **0.1.6**。npm 可用版本以官方 registry 查询为准；文档和源码更新不代表远程网关升级或模型验证成功。
 
+## 未发布
+
+- 修复 `portable-responses` 的两处跨资源兼容：assistant 的 `output_text` 不再改写为仅适用于输入的 `input_text`；`reasoning` 条目降级为仅 `summary`，不再重放资源绑定的 `id` 和 `encrypted_content`。新增对应回归并保留 compaction/未知条目的既有边界。
+
 ## 0.1.6 — 2026-11-06
 
 - 登录顺序保持 API Key 在前、GitHub 在后。API Key 无插件问题，只用宿主原生单输入；保存不代表验证。当前宿主 API `authorize` 不接收原生 key，因此不添加保存前验证、第二个 key 字段、verified 标记或状态徽章。

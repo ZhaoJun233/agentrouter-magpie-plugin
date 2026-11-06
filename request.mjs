@@ -2,7 +2,8 @@ import { redactResponsesBody } from "./content-filter.mjs";
 import { readCloneText } from "./body-inspection.mjs";
 
 // Replay complete items inline instead of asking a load-balanced resource to
-// retrieve them by an old item ID. Never remove call_id or opaque contents.
+// retrieve them by an old item ID. Preserve call_id; reduce reasoning to its
+// portable summary, because ids and encrypted state belong to one resource.
 function isInlinePart(part) {
   if (!part || typeof part !== "object") return false;
   if (["input_text", "input_image", "input_file", "input_audio"].includes(part.type)) return true;
@@ -29,8 +30,8 @@ function hasInlineContent(item) {
     case "function_call_output":
       return typeof item.call_id === "string" && item.call_id.length > 0 &&
         (typeof item.output === "string" || Array.isArray(item.output));
-    // Reasoning IDs are required by the published input schema; encrypted
-    // state has no cross-resource portability guarantee. Preserve it intact.
+    // Reasoning has no message body to inline; replayInline() reduces it to
+    // summary-only below because its IDs and encrypted state are resource-bound.
     case "reasoning":
       return false;
     default:
@@ -78,17 +79,35 @@ function replayInline(body) {
   if (!Array.isArray(body.input) || body.previous_response_id || body.conversation ||
       body.input.some(item => item?.type === "item_reference")) return false;
   let changed = false;
-  for (const item of body.input) {
+  for (let index = 0; index < body.input.length; index += 1) {
+    const item = body.input[index];
+    if (item?.type === "reasoning") {
+      // Reasoning item IDs and encrypted_content identify server-side state on
+      // one OpenAI resource. AgentRouter load-balances across resources, so
+      // replaying either field makes the whole history unusable. The summary is
+      // ordinary text and remains valid across resources.
+      if (!isPortableReasoning(item)) {
+        body.input[index] = { type: "reasoning", summary: Array.isArray(item.summary) ? item.summary : [] };
+        changed = true;
+      }
+      continue;
+    }
     if (!hasInlineContent(item) || !Object.hasOwn(item, "id")) continue;
     delete item.id;
     if (item.type === "message" || item.type == null) {
       // Output-message input objects require an ID. Convert to the supported
       // EasyInputMessage form, preserving phase and every actual text segment.
+      // Assistant output_text is already valid and must not become input_text.
       delete item.status;
-      if (Array.isArray(item.content)) item.content = item.content.map(part =>
+      if (item.role !== "assistant" && Array.isArray(item.content)) item.content = item.content.map(part =>
         part.type === "output_text" ? { type: "input_text", text: part.text } : part);
     }
     changed = true;
   }
   return changed;
+}
+
+function isPortableReasoning(item) {
+  return item && typeof item === "object" && item.type === "reasoning" &&
+    Object.keys(item).length === 2 && Object.hasOwn(item, "summary") && Array.isArray(item.summary);
 }

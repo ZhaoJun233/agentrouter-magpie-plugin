@@ -284,14 +284,14 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 
 如果上游提示 `The requested item was created under a different ... OpenAI resource`，通常是请求引用了另一个资源创建的服务端条目。这不是内容敏感词，也不是改一次 API Key 就能恢复的历史。
 
-默认开启 `portable-responses`：对 `POST .../responses` 中**带完整内联内容**的普通消息和 function-call / function-call-output，去掉用于条目查找的顶层 `id`。普通输出文本转换为 API 支持的内联输入消息，保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果及嵌套业务 `id` 保持不变。有改写时设置 `store:false`，清除旧正文长度/摘要头。未改写时保留原始正文。实现见 [request.mjs](<request.mjs>)。
+默认开启 `portable-responses`：对 `POST .../responses` 中**带完整内联内容**的普通消息和 function-call / function-call-output，去掉用于条目查找的顶层 `id`。普通消息同时删除 `status`；非 assistant 的 `output_text` 转换为 `input_text`，assistant 保留 `output_text`（AgentRouter 只接受 assistant 的 `output_text` / `refusal`），均保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果及嵌套业务 `id` 保持不变。有改写时设置 `store:false`，清除旧正文长度/摘要头。未改写时保留原始正文。实现见 [request.mjs](<request.mjs>)。
 
-0.1.4 额外识别普通 `output_text` 中的空 `logprobs: []`（网关可能随完成消息一起输出）。空概率数组没有内容信息，转换为内联输入文本时可以去掉；**非空、`null` 或形状未知的概率数据保持原样**。这类完整消息的顶层 ID 曾因该字段未被识别而保留，合成资源切换回归覆盖了此缺口。
+0.1.4 额外识别普通 `output_text` 中的空 `logprobs: []`（网关可能随完成消息一起输出）。空概率数组没有内容信息，在非 assistant 的 `output_text` 转换为内联输入文本时可以去掉；**非空、`null` 或形状未知的概率数据保持原样**。这类完整消息的顶层 ID 曾因该字段未被识别而保留，合成资源切换回归覆盖了此缺口。
 
 边界：
 
 - **不删** `previous_response_id`、`conversation` 或 `item_reference`；这些请求不做 ID 重写，因为插件并不知道它们指向的完整历史。0.1.3 的独立文本过滤仍可替换请求中可见的匹配正文，但不能处理引用背后的历史。客户端需要重发完整内联历史，或由上游固定到原资源。
-- **不删改推理及 compaction 条目**，包括它们的 ID、摘要和加密内容。`store:false` 不会让加密状态跨资源通用；不同密钥无法解密时仍须原资源。
+- **推理条目降级为仅 `summary`**：删除资源绑定的 `id` 与 `encrypted_content`，只保留可跨资源复用的摘要数组；本来就是 `{ type, summary }` 两字段的条目不动。**不删改 compaction 及未知条目**。`store:false` 不会让加密状态跨资源通用；不同密钥无法解密时仍须原资源。
 - 非空引用注释、未知消息字段和未知条目类型保留原样，不为修复而静默丢失内容。文件/图像/容器等资源引用也不递归删除。
 - 只处理最多 4 MiB 的 JSON 请求；读取 Request 副本最多 2 秒，支持取消。超限、非 JSON、压缩正文和其他端点不改写。不会自动重试，更不会重放用户历史。
 - 关闭提供商选项 **Replay complete Responses items inline** 只关闭 ID 重写；若启用了下文的本地词表，文本过滤仍独立生效。两个选项都关闭才恢复原始正文透传。只有服务端引用、没有完整内联正文的旧会话，不保证仅升级插件就能继续。

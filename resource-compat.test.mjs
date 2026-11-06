@@ -32,7 +32,7 @@ test("gateway output with empty logprobs replays on a different synthetic resour
   assert.equal(attempts, 1);
   assert.equal(JSON.stringify(before), original);
   assert.deepEqual(JSON.parse(result.body), { store: false, input: [
-    { type: "message", role: "assistant", phase: "commentary", content: [{ type: "input_text", text: "Looking up the item" }] },
+    { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "Looking up the item", annotations: [], logprobs: [] }] },
     { type: "function_call", call_id: "call_keep", name: "lookup", arguments: '{"id":"nested_keep"}' },
     { type: "function_call_output", call_id: "call_keep", output: '{"id":"result_keep"}' },
   ] });
@@ -59,11 +59,12 @@ for (const pointer of [ { previous_response_id: "resp_resource_a" }, { conversat
   assert.equal((await prepareResponsesRequest(url, init)), init);
 });
 
-test("opaque reasoning and compaction survive an adjacent inline message rewrite", async () => {
-  const opaque = [ { type: "reasoning", id: "rs_resource_a", encrypted_content: "synthetic-sealed-data", summary: [] },
-    { type: "compaction", id: "cmp_resource_a", encrypted_content: "synthetic-compressed-data" } ];
-  const result = await prepareResponsesRequest(url, { method: "POST", body: JSON.stringify({ input: [message(), ...opaque] }) });
+test("opaque reasoning becomes summary-only while compaction remains intact", async () => {
+  const reasoning = { type: "reasoning", id: "rs_resource_a", encrypted_content: "synthetic-sealed-data", summary: [{ type: "summary_text", text: "kept summary" }] };
+  const compaction = { type: "compaction", id: "cmp_resource_a", encrypted_content: "synthetic-compressed-data" };
+  const result = await prepareResponsesRequest(url, { method: "POST", body: JSON.stringify({ input: [message(), reasoning, compaction] }) });
   const after = JSON.parse(result.body);
   assert.equal(after.input[0].id, undefined);
-  assert.deepEqual(after.input.slice(1), opaque);
+  assert.deepEqual(after.input[1], { type: "reasoning", summary: [{ type: "summary_text", text: "kept summary" }] });
+  assert.deepEqual(after.input[2], compaction);
 });

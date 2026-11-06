@@ -32,8 +32,25 @@ test("login cookies and site token never enter model requests during inline repl
   assert.equal(calls.length, 2);
 });
 
+test("reasoning history is reduced to a portable summary before forwarding", async t => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let calls = 0, sent;
+  globalThis.fetch = async (_input, init) => {
+    calls++; sent = JSON.parse(init.body);
+    return Response.json({ output: [] });
+  };
+  const p = await plugin({ magpie: { option: (_pid, key) => key === "portable-responses" } });
+  const loader = await p.auth.loader(async () => auth, {});
+  const summary = [{ type: "summary_text", text: "kept summary" }];
+  const before = { input: [{ type: "reasoning", id: "rs_resource_a", summary, encrypted_content: "synthetic-opaque" }] };
+  const res = await loader.fetch(url, { method: "POST", body: JSON.stringify(before) });
+  assert.equal(calls, 1);
+  assert.equal(res.status, 200);
+  assert.deepEqual(sent, { input: [{ type: "reasoning", summary }], store: false });
+});
+
 for (const [label, item] of [
-  ["reasoning", {type:"reasoning",id:"rs_resource_a",summary:[],encrypted_content:"synthetic-opaque"}],
   ["compaction", {type:"compaction",id:"cmp_resource_a",encrypted_content:"synthetic-opaque"}],
   ["attachment", {role:"user",content:[{type:"input_file",file_id:"file_resource_a"}]}],
   ["reference", {type:"item_reference",id:"msg_resource_a"}],

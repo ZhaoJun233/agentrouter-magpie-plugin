@@ -227,7 +227,7 @@ test("request option combinations keep empty-logprobs filtering and replay indep
     const prepared = await prepareRequest(url, init, options);
     const text = textFilter ? "[FILTERED]" : "private-term";
     const expectedMessage = portableResponses
-      ? { type: "message", role: "assistant", phase: "commentary", content: [{ type: "input_text", text }] }
+      ? { type: "message", role: "assistant", phase: "commentary", content: [{ ...message.content[0], text }] }
       : { ...message, content: [{ ...message.content[0], text }] };
     assert.deepEqual(JSON.parse(prepared.body), { input: [expectedMessage], store: !portableResponses }, label);
     if (!portableResponses && !textFilter) assert.equal(prepared, init, label);
@@ -269,11 +269,12 @@ test("cloned Request filtering preserves the original stream", async () => {
   assert.equal(await request.text(), body);
 });
 
-test("filtering and inline replay compose without dropping call IDs or changing opaque reasoning", async () => {
+test("filtering and inline replay compose without dropping call IDs or leaking opaque reasoning", async () => {
   const body = { input: [{ type: "message", role: "assistant", id: "msg_old", content: [{ type: "output_text", text: "private-term", annotations: [] }] }, { type: "reasoning", id: "rs_old", encrypted_content: "private-term", summary: [] }] };
   const result = JSON.parse((await prepareRequest(url, { method: "POST", body: JSON.stringify(body) }, { textFilter: filter() })).body);
   assert.equal(result.input[0].id, undefined); assert.equal(result.input[0].content[0].text, "[FILTERED]");
-  assert.equal(result.store, false); assert.deepEqual(result.input[1], body.input[1]);
+  assert.equal(result.input[0].content[0].type, "output_text");
+  assert.equal(result.store, false); assert.deepEqual(result.input[1], { type: "reasoning", summary: [] });
 });
 
 test("installed loader honors all independent options and their enabled defaults", async t => {
@@ -310,7 +311,7 @@ test("installed loader honors all independent options and their enabled defaults
     const text = current["text-filter"] === false ? "private-term" : "[FILTERED]";
     const expectedMessage = current["portable-responses"] === false
       ? { ...message, content: [{ ...message.content[0], text }] }
-      : { type: "message", role: "assistant", content: [{ type: "input_text", text }] };
+      : { type: "message", role: "assistant", content: [{ ...message.content[0], text }] };
     assert.deepEqual(JSON.parse(sent[count].body), { input: [expectedMessage], store: current["portable-responses"] === false }, label);
     if (current["portable-responses"] === false && current["text-filter"] === false) assert.equal(sent[count].body, init.body);
     assert.equal(JSON.parse(init.body).input[0].content[0].text, "private-term", label);

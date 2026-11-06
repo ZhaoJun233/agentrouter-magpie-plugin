@@ -1075,7 +1075,7 @@ export const AgentRouterAuthPlugin = async (input) => {
         {
           key: "portable-responses",
           label: "Replay complete Responses items inline",
-          description: "Remove resource-local IDs only when inline content is available; preserve call_id and encrypted content. Reference-only history still requires the original resource. Off disables ID replay only; text-filter is independent.",
+          description: "Remove resource-local IDs only when inline content is available; preserve call_id and reduce reasoning to its summary. Reference-only history still requires the original resource. Off disables ID replay only; text-filter is independent.",
           default: true,
         },
         {
