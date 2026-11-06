@@ -181,17 +181,13 @@ test("legacy login without a reward marker is not done", async () => {
   assert.equal(result.outcome, "failed");
 });
 
-test("both login methods expose the optional sensitive GitHub session field", async () => {
-  const p = await plugin();
-  for (const method of p.auth.methods) {
-    const prompt = method.prompts.find(p => p.key === "githubCookie");
-    assert.ok(prompt);
-    assert.equal(prompt.type, "pass" + "word", "GitHub session entry must be concealed");
-    assert.match(prompt.message, /高权限/);
+test("first login excludes optional GitHub Cookie setup", async () => {
+  for (const method of (await plugin()).auth.methods) {
+    assert.equal(method.prompts?.some(p => p.key === "githubCookie") ?? false, false);
   }
 });
 
-test("GitHub authorization preserves the optional session without sending it to site APIs", async () => {
+test("GitHub authorization keeps the site session without configuring GitHub cookie", async () => {
   const real = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
@@ -201,16 +197,17 @@ test("GitHub authorization preserves the optional session without sending it to 
     if (u.pathname === "/api/oauth/state") return json({success:true, data:state});
     if (u.pathname === "/api/status") return json({success:true,data:{github_oauth:true,github_client_id:"ar-app",server_address:SITE}});
     if (u.pathname === "/api/oauth/github") return json({success:true,data:{id:42}}, {"set-cookie":"session=site-session"});
-    if (u.pathname === "/api/token/") return json({success:true,data:[{key:"key-for-test"}]});
+    if (u.pathname === "/api/token/") return json({success:true,data:[{status:1,key:"key-for-test"}]});
     throw new Error("unexpected request");
   };
   try {
     const p = await plugin();
     const method = p.auth.methods.find(m => m.type === "oauth");
     const flow = await method.authorize({site:"org",accessToken:"site-token",githubCookie});
-    const result = await flow.callback("fresh-code");
+    const result = await flow.callback(`${SITE}/oauth/github/magpie?code=fresh-code&state=${state}`);
     assert.equal(result.type, "success");
-    assert.equal(result.metadata.githubCookie, githubCookie);
+    assert.equal(Object.hasOwn(result.metadata, "githubCookie"), false);
+    assert.equal(result.metadata.cookie, "session=site-session");
     assert.equal(result.metadata.accessToken, "site-token");
     assert.equal(calls.length, 4);
   } finally { globalThis.fetch = real; }

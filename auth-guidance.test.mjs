@@ -1,19 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import plugin from "./index.mjs";
+import { parseGithubCookie } from "./github-cookie.mjs";
 
 const valid = "user_session=synthetic-session; logged_in=yes";
+const callback = "https://agentrouter.org/oauth/github/magpie?code=synthetic-code&state=synthetic-state";
 const raw = (body, headers = {}) => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json", ...headers } });
-const applies = (prompt, inputs) => !prompt.when || (prompt.when.op === "eq" ? inputs[prompt.when.key] === prompt.when.value : inputs[prompt.when.key] !== prompt.when.value);
 const methodOf = (p, type) => p.auth.methods.find(m => m.type === type);
-const cookieField = method => method.prompts.find(p => p.key === "githubCookie");
-
-// Magpie 0.1.2897 host.js failed() contract: message is not consumed.
+// Magpie's failed() adapter consumes error, not message.
 function hostFailed(r) {
   const why = typeof r?.error === "string" ? r.error.trim() : r?.error instanceof Error ? r.error.message : "";
   return why ? { ok: false, error: why.slice(0, 500) } : { ok: false };
 }
-
 async function stubFetch(responses, fn) {
   const original = globalThis.fetch;
   const calls = [];
@@ -33,72 +31,107 @@ const oauthResponses = () => [
   raw({ success: true, data: { items: [{ status: 1, key: "synthetic-api-key" }] } }),
 ];
 
-test("Magpie failure adapter preserves safe callback and exchange guidance", async () => {
+test("first login has no optional settings or duplicate API key input", async () => {
+  const p = await plugin({ magpie: {} });
+  assert.deepEqual(p.auth.methods.map(m => m.type), ["api", "oauth"]);
+  assert.deepEqual(methodOf(p, "api").prompts ?? [], []);
+  const prompts = methodOf(p, "oauth").prompts;
+  assert.deepEqual(prompts.map(p => p.key), ["accessToken"]);
+  assert.equal(prompts[0].type, "password");
+  assert.equal(prompts[0].validate("synthetic-access"), undefined);
+  assert.ok(prompts[0].validate(" "));
+  assert.match(prompts[0].message, /不是模型 API Key/);
+});
+
+test("API finalization is local and leaves the host as sole key owner", async () => {
+  const method = methodOf(await plugin({ magpie: {} }), "api");
+  await stubFetch([], async calls => {
+    const inputs = { site: "air", githubCookie: "synthetic-private", accessToken: "synthetic-access" };
+    const before = structuredClone(inputs);
+    const result = await method.authorize(inputs);
+    assert.deepEqual(result, { type: "success", metadata: { site: "org" } });
+    assert.ok(!Object.hasOwn(result, "key"));
+    assert.ok(!Object.hasOwn(result, "verified"));
+    assert.deepEqual(inputs, before);
+    assert.equal(calls.length, 0);
+  });
+});
+
+test("hosts without Magpie retain native API-key entry without a finalize hook", async () => {
+  assert.equal(methodOf(await plugin(), "api").authorize, undefined);
+});
+
+test("GitHub rejects missing management token locally with host-visible guidance", async () => {
   const method = methodOf(await plugin(), "oauth");
-  for (const scenario of [
-    { pasted: "" },
-    { pasted: "https://agentrouter.org/oauth/github/magpie?code=synthetic-code&state=wrong" },
-    { pasted: "synthetic-code", response: raw({ success: false, message: "synthetic-private expired" }) },
-    { pasted: "synthetic-code", response: new Error("synthetic-private network error") },
-    { pasted: "synthetic-code", response: raw({ success: true, data: { id: 42 } }), clearToken: true },
-  ]) {
-    const responses = oauthResponses().slice(0, 2);
-    if (scenario.response) responses.push(scenario.response);
-    await stubFetch(responses, async () => {
-      const inputs = { accessToken: "synthetic-access" };
-      const flow = await method.authorize(inputs);
-      if (scenario.clearToken) inputs.accessToken = "";
-      const result = await flow.callback(scenario.pasted);
+  await stubFetch([], async calls => {
+    for (const value of [undefined, "", " "]) {
+      const result = await method.authorize({ accessToken: value });
       assert.equal(result.type, "failed");
-      const visible = hostFailed(result);
-      assert.equal(visible.ok, false);
-      assert.equal(typeof visible.error, "string", "host must receive actionable error");
-      assert.match(visible.error, /重新/);
-      assert.ok(!visible.error.includes("synthetic"));
+      assert.match(hostFailed(result).error, /系统访问令牌/);
+    }
+    assert.equal(calls.length, 0);
+  });
+});
+
+test("OAuth configuration failures are safe and never become authorization flows", async () => {
+  const method = methodOf(await plugin(), "oauth");
+  for (const responses of [
+    [new Error("synthetic-private network")],
+    [raw({ success: false, message: "synthetic-private" })],
+    [raw({ success: true, data: {} })],
+    [oauthResponses()[0], raw({ data: {} })],
+    [oauthResponses()[0], raw({ data: { github_client_id: "synthetic-client", server_address: "https://foreign.invalid" } })],
+  ]) {
+    await stubFetch(responses, async () => {
+      const result = await method.authorize({ accessToken: "synthetic-access" });
+      assert.equal(result.type, "failed");
+      assert.match(hostFailed(result).error, /API Key/);
+      assert.ok(!JSON.stringify(result).includes("synthetic"));
     });
   }
 });
 
-test("both login methods offer skip-first conditional Cookie setup", async () => {
-  const p = await plugin();
-  for (const method of p.auth.methods) {
-    const mode = method.prompts.find(p => p.key === "githubCookieMode");
-    assert.ok(mode);
-    assert.equal(mode.type, "select");
-    assert.deepEqual(mode.options.map(o => o.value), ["skip", "configure"]);
-    const cookie = cookieField(method);
-    assert.ok(!applies(cookie, {}));
-    assert.ok(!applies(cookie, { githubCookieMode: "skip" }));
-    assert.ok(applies(cookie, { githubCookieMode: "configure" }));
-    assert.equal(cookie.type, "pass" + "word");
-    assert.equal(cookie.validate(""), undefined);
-    assert.equal(cookie.validate("   "), undefined);
-  }
-  const oauth = methodOf(p, "oauth");
-  assert.deepEqual(oauth.prompts.map(p => p.key), ["site", "accessToken", "githubCookieMode", "githubCookie"]);
-  for (const method of p.auth.methods) {
-    assert.equal(method.prompts.find(p => p.key === "accessToken").type, "pass" + "word");
-  }
+test("OAuth captures only its token and saves a usable model key plus site session", async () => {
+  const method = methodOf(await plugin(), "oauth");
+  await stubFetch(oauthResponses(), async calls => {
+    const inputs = { accessToken: "synthetic-access", githubCookie: valid, site: "air", headers: "X-Private: ignored" };
+    const flow = await method.authorize(inputs);
+    inputs.accessToken = "changed-private";
+    const result = await flow.callback(callback);
+    assert.equal(result.type, "success");
+    assert.equal(result.key, "synthetic-api-key");
+    assert.deepEqual(result.metadata, { accessToken: "synthetic-access", userId: "42", site: "org", cookie: "session=synthetic-site" });
+    assert.ok(calls.every(c => c.url.startsWith("https://agentrouter.org/")));
+    assert.ok(calls.every(c => !new Headers(c.init.headers).has("Cookie")));
+    assert.equal(new Headers(calls[3].init.headers).get("Authorization"), "synthetic-access");
+  });
 });
 
-test("Cookie guidance contains browser steps, credential boundaries and safe escape", async () => {
-  for (const method of (await plugin()).auth.methods) {
-    const message = cookieField(method).message;
-    for (const phrase of ["https://github.com", "同一", "开发者工具", "Network", "Request Headers", "Cookie", "Set-Cookie", "HttpOnly", "高权限", "网关", "留空", "聊天"]) {
-      assert.ok(message.includes(phrase), "missing guidance: " + phrase);
-    }
-    assert.ok(message.includes("不能自动"));
-  }
+test("OAuth bare codes and exchange network errors fail safely", async () => {
+  const method = methodOf(await plugin(), "oauth");
+  await stubFetch(oauthResponses().slice(0, 2), async calls => {
+    const flow = await method.authorize({ accessToken: "synthetic-access" });
+    assert.equal((await flow.callback("synthetic-code")).type, "failed");
+    assert.equal(calls.length, 2);
+  });
+  await stubFetch([...oauthResponses().slice(0, 2), new Error("synthetic-private")], async () => {
+    const flow = await method.authorize({ accessToken: "synthetic-access" });
+    const result = await flow.callback(callback);
+    assert.equal(result.type, "failed");
+    assert.match(hostFailed(result).error, /重新/);
+    assert.ok(!JSON.stringify(result).includes("synthetic"));
+  });
 });
 
+// Cookie parsing remains an advanced/manual capability, not an onboarding prompt.
 test("Cookie validation accepts supported formats without network access", async () => {
-  const validate = cookieField(methodOf(await plugin(), "oauth")).validate;
+  const validate = value => parseGithubCookie(value).error;
   const inputs = [valid, "Cookie: " + valid, "__Host-user_session_same_site=synthetic-host", "user_session\tsynthetic-session\t.github.com\t/\nlogged_in\tyes\t.github.com\t/", JSON.stringify([{ name: "user_session", value: "synthetic-session", domain: ".github.com" }, { name: "unrelated", value: "ignored", domain: ".example.test" }])];
   await stubFetch([], () => { for (const value of inputs) assert.equal(validate(value), undefined); });
 });
 
 test("Cookie validation rejects wrong credentials and never echoes them", async () => {
-  const validate = cookieField(methodOf(await plugin(), "oauth")).validate;
+  const validate = value => parseGithubCookie(value).error;
   const invalid = ["session=synthetic-private", "synthetic-private", "user_session=", "user_session=synthetic-private; logged_in=no", "Set-Cookie: user_session=synthetic-private; Path=/", "Cookie: " + valid + "\r\nAuthorization: Bearer synthetic-private", JSON.stringify([{ name: "user_session", value: "synthetic-private", domain: ".example.test" }]), JSON.stringify([{ name: "user_session", value: "synthetic-private; injected=value", domain: "github.com" }]), JSON.stringify({ user_session: "synthetic-private" }), "[broken-synthetic-private", "user_session=synthetic-private\u0000", "user_session=" + "x".repeat(32768), "user_session=" + "词".repeat(11000)];
   await stubFetch([], () => {
     for (const value of invalid) {
@@ -111,64 +144,9 @@ test("Cookie validation rejects wrong credentials and never echoes them", async 
 });
 
 test("Cookie validation observes the exact UTF-8 byte limit", async () => {
-  const validate = cookieField(methodOf(await plugin(), "oauth")).validate;
+  const validate = value => parseGithubCookie(value).error;
   assert.equal(validate("user_session=" + "x".repeat(32768 - "user_session=".length)), undefined);
   assert.equal(typeof validate("user_session=" + "x".repeat(32769 - "user_session=".length)), "string");
-});
-
-test("OAuth rejects invalid Cookie and unknown mode before requesting state", async () => {
-  const method = methodOf(await plugin(), "oauth");
-  await stubFetch([], async calls => {
-    await assert.rejects(() => method.authorize({ site: "org", accessToken: "synthetic-access", githubCookie: "session=synthetic-private" }), /GitHub/);
-    await assert.rejects(() => method.authorize({ site: "org", accessToken: "synthetic-access", githubCookieMode: "other" }), /选择/);
-    assert.equal(calls.length, 0);
-  });
-});
-
-test("OAuth saves normalized Cookie, while legacy callers remain supported", async () => {
-  const method = methodOf(await plugin(), "oauth");
-  for (const inputs of [{ githubCookieMode: "configure", githubCookie: "Cookie: " + valid }, { githubCookie: valid }]) {
-    await stubFetch(oauthResponses(), async calls => {
-      const flow = await method.authorize({ site: "org", accessToken: "synthetic-access", ...inputs });
-      const result = await flow.callback("https://agentrouter.org/oauth/github/magpie?code=synthetic-code&state=synthetic-state");
-      assert.equal(result.type, "success");
-      assert.equal(result.metadata.githubCookie, valid);
-      assert.ok(calls.every(c => !new Headers(c.init.headers).get("Cookie")?.includes("user_session")));
-    });
-  }
-});
-
-test("OAuth explicit skip clears hidden input and empty configure still signs in", async () => {
-  const method = methodOf(await plugin(), "oauth");
-  for (const inputs of [{ githubCookieMode: "skip", githubCookie: "hidden-private" }, { githubCookieMode: "configure", githubCookie: "" }]) {
-    await stubFetch(oauthResponses(), async () => {
-      const flow = await method.authorize({ site: "org", accessToken: "synthetic-access", ...inputs });
-      const result = await flow.callback("synthetic-code");
-      assert.equal(result.type, "success");
-      assert.equal(result.metadata.githubCookie, "");
-      assert.equal({ ...inputs, ...result.metadata }.githubCookie, "");
-    });
-  }
-});
-
-test("Magpie API finalization preserves host key ownership and canonicalizes metadata", async () => {
-  const method = methodOf(await plugin({ magpie: {} }), "api");
-  await stubFetch([], async () => {
-    const inputs = { githubCookie: "Cookie: " + valid, githubCookieMode: "configure", accessToken: "synthetic-access" };
-    const result = await method.authorize(inputs);
-    assert.equal(result.type, "success");
-    assert.ok(!Object.hasOwn(result, "key"));
-    const metadata = { ...inputs, ...result.metadata };
-    assert.equal(metadata.githubCookie, valid);
-    assert.equal(result.key ?? "host-supplied-api-key", "host-supplied-api-key");
-    const skip = await method.authorize({ githubCookieMode: "skip", githubCookie: "hidden-private" });
-    assert.equal(skip.metadata.githubCookie, "");
-    await assert.rejects(() => method.authorize({ githubCookie: "session=synthetic-private" }), /GitHub/);
-  });
-});
-
-test("hosts without Magpie retain native API-key entry without a finalize hook", async () => {
-  assert.equal(methodOf(await plugin(), "api").authorize, undefined);
 });
 
 test("OAuth guidance and callback errors explain next steps without leaking input", async () => {
@@ -183,52 +161,6 @@ test("OAuth guidance and callback errors explain next steps without leaking inpu
       assert.ok(/重新|完整|授权/.test(hostFailed(result).error));
     }
     assert.equal(calls.length, 2);
-  });
-});
-
-test("API finalization keeps all host metadata and ignores hidden skip values", async () => {
-  const method = methodOf(await plugin({ magpie: {} }), "api");
-  const inputs = { site: "air", endpoint: "https://example.invalid", userId: "42", accessToken: "synthetic-access", cookie: "session=synthetic-site", username: "legacy-user", githubCookieMode: "skip", githubCookie: "x".repeat(33 * 1024) };
-  const original = { ...inputs };
-  await stubFetch([], async calls => {
-    const result = await method.authorize(inputs);
-    assert.equal(result.type, "success");
-    assert.deepEqual(result.metadata, { ...inputs, githubCookie: "" });
-    assert.equal(Object.hasOwn(result, "key"), false);
-    assert.deepEqual(inputs, original);
-    assert.equal(calls.length, 0);
-  });
-});
-
-test("Cookie finalization filters foreign export domains across supported formats", async () => {
-  const method = methodOf(await plugin({ magpie: {} }), "api");
-  for (const cookie of [
-    "Name\tValue\tDomain\nuser_session\tsynthetic-session\t.github.com\nforeign\tsynthetic-private\telsewhere.invalid\nlogged_in\tyes\tgithub.com",
-    JSON.stringify([{ name: "user_session", value: "synthetic-session", domain: ".github.com" }, { name: "foreign", value: "synthetic-private", domain: "github.com.evil.invalid" }, { name: "logged_in", value: "yes", domain: "github.com" }]),
-  ]) {
-    const result = await method.authorize({ githubCookieMode: "configure", githubCookie: cookie });
-    assert.equal(result.metadata.githubCookie, valid);
-  }
-});
-
-test("Cookie parser refuses empty sessions, nonstring rows, and control characters", async () => {
-  const method = methodOf(await plugin({ magpie: {} }), "api");
-  const invalid = [
-    "user_session=", "user_session=synthetic; user_session=", "__Host-user_session_same_site=", "user_session=synthetic; logged_in=no",
-    "user_session=synthetic\u0000", "user_session=synthetic\u007f", "user_session=synthetic\t",
-    JSON.stringify([{ name: "user_session", value: "synthetic\r\nInjected: yes", domain: ".github.com" }]),
-    JSON.stringify([{ name: "user_session", value: 123, domain: ".github.com" }]),
-    JSON.stringify([{ name: "user_session", value: "synthetic", domain: "sub.github.com" }]),
-    "[invalid-json", "{\"user_session\":\"synthetic\"}",
-  ];
-  await stubFetch([], async calls => {
-    for (const cookie of invalid) {
-      const message = cookieField(method).validate(cookie);
-      assert.equal(typeof message, "string", "prompt rejects malformed input");
-      await assert.rejects(method.authorize({ githubCookie: cookie }), error => error.message === message);
-      assert.ok(!message.includes("synthetic"));
-    }
-    assert.equal(calls.length, 0);
   });
 });
 
@@ -254,7 +186,7 @@ test("OAuth callback rejects foreign, ambiguous, and malformed URLs without exch
   });
   await stubFetch(oauthResponses(), async () => {
     const flow = await method.authorize({ accessToken: "synthetic-access" });
-    assert.equal((await flow.callback("synthetic-code")).type, "success");
+    assert.equal((await flow.callback(callback)).type, "success");
   });
 });
 
@@ -262,7 +194,7 @@ test("OAuth exchange failure does not echo upstream code or session material", a
   const method = methodOf(await plugin(), "oauth");
   await stubFetch([...oauthResponses().slice(0, 2), raw({ success: false, message: "synthetic-private code expired" })], async () => {
     const flow = await method.authorize({ accessToken: "synthetic-access" });
-    const result = await flow.callback("synthetic-code");
+    const result = await flow.callback(callback);
     assert.equal(result.type, "failed");
     assert.ok(!hostFailed(result).error.includes("synthetic-private"));
     assert.match(hostFailed(result).error, /重新/);

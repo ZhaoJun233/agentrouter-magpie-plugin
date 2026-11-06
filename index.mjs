@@ -324,52 +324,10 @@ async function jsonOrText(res) {
 // used here only has to survive the authorize step.
 const GITHUB_CALLBACK_PATH = "/oauth/github/magpie";
 
-// The form and check-in use the same local parser. A missing mode is a legacy
-// caller; explicit skip must erase a hidden value when Magpie merges metadata.
-function githubCookieForAuth(inputs) {
-  const mode = inputs?.githubCookieMode;
-  if (mode === "skip") return "";
-  if (mode !== undefined && mode !== "configure") {
-    throw new Error("请选择跳过或配置 GitHub 自动签到");
-  }
-  const parsed = parseGithubCookie(inputs?.githubCookie);
-  if (parsed.error) throw new Error(parsed.error);
-  return parsed.cookie;
-}
-
-function githubCookiePrompts() {
-  return [
-    {
-      type: "select",
-      key: "githubCookieMode",
-      message: "是否配置 GitHub 签到续期？跳过不影响普通登录和 API 调用，可稍后配置",
-      options: [
-        { label: "跳过，暂不配置（推荐）", value: "skip" },
-        { label: "配置 GitHub Cookie", value: "configure" },
-      ],
-    },
-    {
-      type: "password",
-      key: "githubCookie",
-      when: { key: "githubCookieMode", op: "eq", value: "configure" },
-      message: "GitHub 登录 Cookie（可选，可留空放弃配置）\n" +
-        "1. 在自己的浏览器打开 https://github.com，登录与 AgentRouter 绑定的同一 GitHub 账号。\n" +
-        "2. 打开开发者工具 → Network/网络，刷新页面，选择发往 github.com 的页面请求。\n" +
-        "3. 在 Request Headers/请求标头中找到 Cookie，只复制其值回到这里粘贴；不要复制 Set-Cookie、整份标头或 AgentRouter Cookie。\n" +
-        "4. 无需运行控制台脚本；document.cookie 无法取得完整的 HttpOnly 登录 Cookie。\n" +
-        "这是高权限凭证，会提交并保存到自己的网关，仅在可信网关使用。勿发到聊天、截图、日志或公共仓库。插件不能自动读取浏览器或剪贴板，也不能自动弹出 Cookie 获取窗口。\n" +
-        "找不到、不愿提供或暂不配置可留空或选择跳过。格式合格不代表线上有效或账号正确；Cookie 失效或需要二次验证时仍须人工更新，不保证永久自动签到。",
-      placeholder: "user_session=…; logged_in=yes（非 AgentRouter session）",
-      validate: value => parseGithubCookie(value).error,
-    },
-  ];
-}
-
-// Full callback URLs must belong to this flow. A code alone remains supported.
+// Login accepts only a full callback URL belonging to this flow.
 function githubCallbackCode(pasted, expectedURL, state) {
   const text = String(pasted ?? "").trim();
   if (!text || text.length > 8192) return "";
-  if (/^[A-Za-z0-9_-]{8,2048}$/.test(text)) return text;
   try {
     const url = new URL(text);
     const expected = new URL(expectedURL);
@@ -400,8 +358,8 @@ async function oauthState(base) {
       signal: withTimeout(REQUEST_TIMEOUT),
     });
     const { json } = await jsonOrText(res);
-    const st = String(json?.data ?? "").trim();
-    if (!json?.success || !st) return { ok: false, why: "站点没有下发 OAuth state" };
+    const st = typeof json?.data === "string" ? json.data.trim() : "";
+    if (!res.ok || json?.success !== true || !st) return { ok: false, why: "站点没有下发 OAuth state" };
     return { ok: true, state: st };
   } catch (e) {
     return { ok: false, why: `拿不到 OAuth state：${e?.message ?? String(e)}` };
@@ -421,10 +379,16 @@ async function siteAuthConfig(base) {
       signal: withTimeout(REQUEST_TIMEOUT),
     });
     const { json } = await jsonOrText(res);
-    const id = String(json?.data?.github_client_id ?? "").trim();
-    if (!id) return { ok: false, why: "站点没有开启 GitHub 登录" };
-    const reported = String(json?.data?.server_address ?? "").trim().replace(/\/+$/, "");
-    return { ok: true, id, origin: reported || base.replace(/\/+$/, "") };
+    const id = typeof json?.data?.github_client_id === "string" ? json.data.github_client_id.trim() : "";
+    if (!res.ok || !id) return { ok: false, why: "站点没有开启 GitHub 登录" };
+    const reported = json.data.server_address;
+    if (reported != null && typeof reported !== "string") return { ok: false, why: "站点回调地址无效" };
+    const url = new URL(String(reported ?? "").trim() || base);
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash ||
+        !Object.values(SITES).some(site => site.site === url.origin)) {
+      return { ok: false, why: "站点回调地址不受信任" };
+    }
+    return { ok: true, id, origin: url.origin };
   } catch (e) {
     return { ok: false, why: `读不到站点配置：${e?.message ?? String(e)}` };
   }
@@ -478,72 +442,86 @@ function sessionOf(res) {
 // /api/user routes take. The account keeps this session alongside the
 // system access token explicitly entered before authorization.
 async function redeemGithub(base, code, state, inputs) {
-  let json;
-  let session = "";
-  try {
-    const res = await fetch(
-      `${base}/api/oauth/github?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}&mode=login`,
-      { headers: DEFAULT_HEADERS, signal: withTimeout(REQUEST_TIMEOUT) },
-    );
-    session = sessionOf(res);
-    ({ json } = await jsonOrText(res));
-  } catch {
-    return { type: "failed", error: "兑换 GitHub 授权失败，请检查网络后重新发起登录；不要重复使用旧授权码" };
+  const token = String(inputs.accessToken ?? "").trim();
+  if (!token) return { type: "failed", error: "缺少系统访问令牌，请重新登录或改用 API Key 接入。" };
+  const u = new URL(base + "/api/oauth/github");
+  u.searchParams.set("code", code);
+  u.searchParams.set("state", state);
+  u.searchParams.set("mode", "login");
+  const res = await fetch(u, { headers: DEFAULT_HEADERS, redirect: "manual", signal: withTimeout(REQUEST_TIMEOUT) });
+  const session = sessionOf(res);
+  const { json } = await jsonOrText(res);
+  const d = json?.data;
+  if (!res.ok || json?.success !== true || !d?.id) {
+    return { type: "failed", error: "GitHub 授权兑换未完成，授权码可能已使用或过期；请重新授权或改用 API Key 接入。" };
   }
-  if (!json?.success) {
-    return { type: "failed", error: "GitHub 授权兑换失败，授权码可能已使用或过期；请重新发起登录并复制新的完整回调地址" };
+  const found = await keyOf(base, token, String(d.id));
+  if (found.kind !== "found") {
+    const messages = {
+      missing: "未找到启用且完整的模型 Key",
+      ambiguous: "存在多个不同的模型 Key，无法确定使用哪一个",
+      incomplete: "模型 Key 列表可能不完整，无法确定唯一候选",
+      rejected: "站点拒绝读取模型 Key，请检查系统访问令牌及权限",
+      blocked: "读取模型 Key 时遇到站点验证页",
+      unsupported: "站点返回的模型 Key 列表格式无法确认",
+      upstream: "站点暂时无法提供模型 Key 列表",
+      network: "读取模型 Key 的网络请求失败或超时",
+    };
+    return { type: "failed", error: messages[found.kind] + "。请改用 API Key 接入，或确认后主动重试。" };
   }
-  const d = json.data ?? {};
-  const id = d.id ?? "";
-  // Keep the explicitly entered system token; regenerating it here would
-  // invalidate the token the user just supplied.
-  const token = String(inputs?.accessToken ?? "").trim();
-  if (!token) return { type: "failed", error: "请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌）后重新登录" };
-
-  // The completions key is not in this answer either, so it is read with the
-  // token: the account's own key list. A site that refuses leaves the key
-  // empty, and the account then reads as signed in but unable to chat, which
-  // its row says.
-  const key = await keyOf(base, token, id);
   return {
     type: "success",
-    // magpie saves this as an API sign-in: the key for completions, the
-    // access token beside it for the balance and the check-in, and the
-    // browser session the site itself set, which is what gets a /api/user
-    // read past the WAF.
-    key: key ?? "",
+    key: found.key,
     metadata: {
+      site: "org",
       accessToken: token,
-      userId: String(id ?? ""),
-      site: String(inputs?.site ?? "org"),
-      ...(session ? { cookie: `session=${session}` } : {}),
-      githubCookie: inputs?.githubCookie ?? "",
-      ...(inputs?.githubCookieMode ? { githubCookieMode: inputs.githubCookieMode } : {}),
+      userId: String(d.id),
+      ...(session ? { cookie: "session=" + session } : {}),
     },
   };
 }
 
-// keyOf reads the account's key with the access token just obtained.
-// /api/token/ is a normal user route and answers JSON, so it works where
-// /api/user/self may be behind the WAF.
-//
-// The key is taken as the site stores it rather than required to start with
-// "sk-": New API keeps a key exactly as it was generated, and this site's own
-// list holds the bare 48 characters, which its /v1 routes accept on their own.
-// An empty entry is the only thing that means "no key".
+function usableModelKey(value) {
+  if (typeof value !== "string") return false;
+  const key = value.trim();
+  return key !== "" && !["agentrouter", "your_api_key"].includes(key.toLowerCase()) && !/[*…<>]|\.\.\.|\s/.test(key);
+}
+
+function selectModelKey(json, pageSize) {
+  const data = json?.data;
+  const items = Array.isArray(data) ? data : data?.items;
+  if (!Array.isArray(items)) return { kind: "unsupported" };
+  const total = Array.isArray(data) ? json.total : data?.total;
+  if (total != null && (!Number.isSafeInteger(total) || total < items.length)) return { kind: "unsupported" };
+  if (total != null ? total > items.length : items.length >= pageSize) return { kind: "incomplete" };
+  const keys = new Set();
+  const now = Date.now() / 1000;
+  for (const item of items) {
+    if (item?.status !== 1 || !usableModelKey(item.key)) continue;
+    const expiry = item.expired_time;
+    if (expiry != null && (typeof expiry !== "number" || !Number.isFinite(expiry) || (expiry !== -1 && expiry <= now))) continue;
+    keys.add(item.key.trim());
+  }
+  if (keys.size === 0) return { kind: "missing" };
+  if (keys.size !== 1) return { kind: "ambiguous" };
+  return { kind: "found", key: keys.values().next().value };
+}
+
 async function keyOf(base, token, id) {
+  const pageSize = 10;
   try {
-    const res = await fetch(`${base}/api/token/?p=1&page_size=10`, {
-      headers: { ...DEFAULT_HEADERS, Authorization: token, "New-Api-User": String(id ?? "") },
+    const res = await fetch(base + "/api/token/?p=1&page_size=" + pageSize, {
+      headers: { ...DEFAULT_HEADERS, Authorization: token, "New-Api-User": id },
       signal: withTimeout(REQUEST_TIMEOUT),
     });
-    const { json } = await jsonOrText(res);
-    const items = json?.data?.items;
-    if (!Array.isArray(items)) return "";
-    const live = items.find((x) => x && x.status === 1 && typeof x.key === "string") ?? items.find((x) => x && typeof x.key === "string");
-    return String(live?.key ?? "").trim();
+    const { json, text } = await jsonOrText(res);
+    if (!json && /^\s*</.test(text)) return { kind: "blocked" };
+    if (res.status === 401 || res.status === 403) return { kind: "rejected" };
+    if (!res.ok) return { kind: "upstream" };
+    if (json?.success === false) return { kind: "rejected" };
+    return selectModelKey(json, pageSize);
   } catch {
-    return "";
+    return { kind: "network" };
   }
 }
 
@@ -988,144 +966,64 @@ export const AgentRouterAuthPlugin = async (input) => {
       methods: [
         {
           type: "api",
-          label: "AgentRouter API 密钥",
-          placeholder: "sk-…",
-          prompts: [
-            {
-              type: "text",
-              key: "endpoint",
-              message: "请求端点（对话与模型列表）",
-              placeholder: ENDPOINT,
-              // The key is asked for separately, last. This question is here
-              // because the editor's box is where the key used to go: a key
-              // pasted into it becomes apiBase's endpoint and every request
-              // then goes nowhere, silently. So the answer is checked here,
-              // where the user can still be told.
-              validate: (v) =>
-                !String(v ?? "").trim() || isURLish(v)
-                  ? undefined
-                  : "请填站点地址，例如 https://agentrouter.org（不要在这里填 API 密钥）",
-            },
-            {
-              type: "select",
-              key: "site",
-              message: "站点（签到与余额走这里）",
-              options: [
-                { label: "agentrouter.org", value: "org" },
-                { label: "ps.air-outer.com（备用域名）", value: "air" },
-              ],
-            },
-            ...githubCookiePrompts(),
-            {
-              type: "text",
-              key: "username",
-              message: "旧版兼容：站点用户名（GitHub-only 账号留空）",
-              placeholder: "AgentRouter GitHub 账号无需填写",
-            },
-            {
-              type: "text",
-              key: "password",
-              message: "旧版兼容：站点密码（仅支持密码登录的站点适用；保存在网关服务器）",
-              placeholder: "AgentRouter GitHub 账号留空，不需要也不能在这里设置密码",
-            },
-            {
-              type: "text",
-              key: "cookie",
-              message: "浏览器 Cookie（可选，登录站点后复制请求中的 Cookie；需同时填用户 ID，仍可能被验证码拦截）",
-              placeholder: "session=…",
-            },
-            {
-              type: "password",
-              key: "accessToken",
-              message: "系统访问令牌（可选，AgentRouter「个人设置 → 访问令牌」；不是 API Key 或 GitHub Token，本站 Cookie 有效时不需要）",
-              placeholder: "留空则用浏览器 Cookie 读取余额",
-            },
-            {
-              type: "text",
-              key: "userId",
-              message: "本站用户 ID（New-Api-User；API 登录配置 GitHub 自动签到或读取账号数据时需填写；GitHub 登录会自动获取）",
-              placeholder: "例如 1234",
-            },
-            {
-              type: "text",
-              key: "headers",
-              message: "自定义请求头：每行一个「名称: 值」，留空则用默认的 Codex 客户端标识",
-              placeholder: "User-Agent: codex_cli_rs/0.101.0",
-            },
-          ],
-          // Magpie falls back to the separately entered key when this result
-          // omits key. Only normalize metadata; other hosts keep native entry.
-          ...(input?.magpie ? { authorize: async (inputs) => ({
-            type: "success",
-            metadata: { ...inputs, githubCookie: githubCookieForAuth(inputs) },
-          }) } : {}),
+          label: "API Key（推荐）",
+          // The current host owns the one native Key input and saves it.
+          // Its authorize callback does not receive that Key for validation.
+          ...(input?.magpie ? {
+            authorize: async () => ({ type: "success", metadata: { site: "org" } }),
+          } : {}),
         },
         {
-          // Signing in the way the site's own "Login with GitHub" button does.
-          //
-          // Ask for the site's system access token before authorization.
-          // GitHub supplies the user ID and session; the entered token is kept
-          // for account reads and is never regenerated by this flow.
-          //
-          // The GitHub app is the site's, so its callback is the site's own
-          // page and the code lands in the browser's address bar rather than at
-          // a server this plugin runs. That is why the code is asked for: the
-          // user pastes the address the browser ended on, and the code is read
-          // out of it.
           type: "oauth",
-          label: "用 GitHub 登录 AgentRouter（推荐）",
+          label: "GitHub（需系统访问令牌）",
           authorize: async (inputs) => {
-            const githubCookie = githubCookieForAuth(inputs);
-            if (!String(inputs?.accessToken ?? "").trim()) {
-              throw new Error("请填写系统访问令牌（AgentRouter 个人设置 → 访问令牌，不是 API 密钥或 GitHub Token）");
+            const token = String(inputs?.accessToken ?? "").trim();
+            if (!token) return { type: "failed", error: "请输入系统访问令牌；如已有模型 Key，请改用 API Key 接入。" };
+            const selected = SITES.org;
+            let state, cfg;
+            try {
+              const st = await oauthState(selected.site);
+              if (!st.ok || typeof st.state !== "string" || !st.state.trim()) throw new Error("invalid OAuth state");
+              state = st.state;
+              cfg = await siteAuthConfig(selected.site);
+              if (!cfg.ok || !cfg.id) throw new Error("invalid OAuth configuration");
+            } catch {
+              return { type: "failed", error: "无法获取 GitHub 授权配置，请检查网络或站点验证后重试，也可改用 API Key 接入。" };
             }
-            const site = siteOf(String(inputs?.site ?? "org"));
-            const st = await oauthState(site.site);
-            if (!st.ok) throw new Error(st.why);
-            const cid = await siteAuthConfig(site.site);
-            if (!cid.ok) throw new Error(cid.why);
-            const url =
-              "https://github.com/login/oauth/authorize" +
-              `?client_id=${encodeURIComponent(cid.id)}` +
-              `&state=${encodeURIComponent(st.state)}` +
-              "&scope=user:email" +
-              `&redirect_uri=${encodeURIComponent(callbackUrl(cid.origin))}`;
+            const u = new URL("https://github.com/login/oauth/authorize");
+            const redirectUri = callbackUrl(cfg.origin);
+            u.searchParams.set("client_id", cfg.id);
+            u.searchParams.set("redirect_uri", redirectUri);
+            u.searchParams.set("scope", "user:email");
+            u.searchParams.set("state", state);
             return {
-              url,
-              instructions:
-                "若未自动打开浏览器，请手动打开上方链接。不要刷新授权后的页面，以免一次性 code 被消耗。\n" +
-                `在打开的页面用 GitHub 登录并授权。授权后浏览器会跳到 ${cid.origin} 下的一个地址，` +
-                "它显示的是「页面未找到」——这是正常的，那一页不会用掉你的授权码。" +
-                "请把地址栏里的完整地址（含 code=… 和 state=…）复制下来，回到这里粘贴；也可仅粘贴 code。\n" +
-                "这个链接只完成站点登录，不会自动读取或弹出 GitHub Cookie 获取窗口；Cookie 是以后自动签到的可选配置。\n" +
-                "授权码是一次性的；若已使用或过期失效，请重新发起登录，不要重复提交旧地址。若 GitHub 显示回调地址未注册/redirect_uri mismatch，请联系站点管理员；这不是 Cookie 或二次验证的问题。",
+              url: u.href,
               method: "code",
-              // The code is read from whatever the user pastes: the whole
-              // callback URL, or just the code.
-              callback: async (pasted) => {
-                const code = githubCallbackCode(pasted, callbackUrl(cid.origin), st.state);
-                if (!code) return { type: "failed", error: "GitHub 回调地址、state 或授权码无效，或授权已取消；请重新登录并复制完整回调地址或仅 code" };
-                return redeemGithub(site.site, code, st.state, { ...inputs, githubCookie });
+              instructions: "若未自动打开浏览器，请手动打开链接并完成 GitHub 授权。最终页面可能显示「页面未找到」，请勿刷新；复制地址栏的完整回调地址并粘贴回来，保留 code 和 state。授权码一次有效，失效后请重新登录。插件只查找已有模型 Key；失败时可改用 API Key 接入。请勿将回调地址发到聊天或日志。",
+              callback: async (value) => {
+                let cb;
+                try {
+                  if (typeof value !== "string" || !value.trim().startsWith("https://")) throw new Error("full callback required");
+                  cb = githubCallbackCode(value, redirectUri, state);
+                  if (!cb) throw new Error("invalid callback");
+                } catch {
+                  return { type: "failed", error: "回调地址无效或 state 不匹配。请重新登录获得新链接，再粘贴完整回调地址。" };
+                }
+                try {
+                  return await redeemGithub(selected.site, cb, state, { accessToken: token });
+                } catch {
+                  return { type: "failed", error: "GitHub 授权兑换请求失败或超时，请重新授权重试或改用 API Key 接入。" };
+                }
               },
             };
           },
           prompts: [
             {
-              type: "select",
-              key: "site",
-              message: "站点",
-              options: [
-                { label: "agentrouter.org", value: "org" },
-                { label: "ps.air-outer.com（备用域名）", value: "air" },
-              ],
-            },
-            {
               type: "password",
               key: "accessToken",
-              message: "系统访问令牌（必填，AgentRouter「个人设置 → 访问令牌」；不是 API 密钥或 GitHub Token）",
-              placeholder: "粘贴系统访问令牌，用于查询账号额度",
+              message: "系统访问令牌（AgentRouter 个人设置 → 访问令牌；不是模型 API Key）",
+              validate: value => String(value ?? "").trim() ? undefined : "请输入系统访问令牌；如已有模型 Key，请改用 API Key 入口",
             },
-            ...githubCookiePrompts(),
           ],
         },
       ],
@@ -1134,8 +1032,7 @@ export const AgentRouterAuthPlugin = async (input) => {
       // are present. Server-only references and unknown kinds stay untouched.
       // Response normalization preserves successful bytes and never retries.
       async loader(getAuth, provider) {
-        const auth = await getAuth();
-        if (!auth) return {};
+        const auth = (await getAuth()) ?? {};
         const textFilter = textFilterEnabled() ? await loadTextFilter() : null;
         const base = apiBase(provider, auth);
         return {
@@ -1143,6 +1040,13 @@ export const AgentRouterAuthPlugin = async (input) => {
           apiKey: apiKey(auth) || "agentrouter",
           async fetch(input, init = {}) {
             const key = apiKey(auth);
+            if (!usableModelKey(key)) {
+              return Response.json({ error: {
+                type: "invalid_request_error",
+                code: "agentrouter_missing_api_key",
+                message: "尚未配置模型 API Key，请使用 API Key 入口补充。系统访问令牌和 GitHub Cookie 不能用于模型调用。",
+              } }, { status: 400 });
+            }
             const h = new Headers(input instanceof Request ? input.headers : undefined);
             new Headers(init.headers ?? {}).forEach((v, k) => h.set(k, v));
             applyHeaders(h, headersOf(provider, auth));

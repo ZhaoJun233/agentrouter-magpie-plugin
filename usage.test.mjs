@@ -6,11 +6,12 @@ const plugin = await AgentRouterAuthPlugin();
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
 
 const apiMethod = (p) => p.auth.methods.find((m) => m.type === 'api');
-const prompt = (p, key) => apiMethod(p).prompts.find((x) => x.key === key);
 
 test('GitHub login requires a system access token before requesting authorization', async () => {
   const method = plugin.auth.methods.find((m) => m.type === 'oauth');
-  await assert.rejects(() => method.authorize({ site: 'org', accessToken: '  ' }), /系统访问令牌/);
+  const result = await method.authorize({ site: 'org', accessToken: '  ' });
+  assert.equal(result.type, 'failed');
+  assert.match(result.error, /系统访问令牌/);
 });
 
 test('GitHub login saves the entered token and never regenerates it', async () => {
@@ -26,13 +27,13 @@ test('GitHub login saves the entered token and never regenerates it', async () =
     json({ success: true, data: { items: [{ status: 1, key: 'sk-example' }] } }),
   ];
   globalThis.fetch = async (url, init) => {
-    calls.push({ url, ...init });
+    calls.push({ url: String(url), ...init });
     assert.ok(responses.length, `Unexpected request: ${url}`);
     return responses.shift();
   };
   try {
     const authorization = await method.authorize({ site: 'org', accessToken: '  entered-token  ' });
-    const result = await authorization.callback('examplecode');
+    const result = await authorization.callback('https://agentrouter.org/oauth/github/magpie?code=examplecode&state=oauth-state');
     assert.equal(result.type, 'success');
     assert.equal(result.metadata.accessToken, 'entered-token');
     assert.equal(result.metadata.cookie, 'session=example');
@@ -45,14 +46,8 @@ test('GitHub login saves the entered token and never regenerates it', async () =
   }
 });
 
-test('A key pasted into the endpoint question is refused there and ignored at request time', async () => {
-  // The question is where the key used to go, so a key pasted into it is the
-  // mistake this guards: told to the user while they can still fix it, and
-  // never used to build a base even when it is already stored.
-  const validate = prompt(plugin, 'endpoint').validate;
-  assert.equal(validate(''), undefined);
-  assert.equal(validate('https://agentrouter.org'), undefined);
-  assert.match(validate('sk-example'), /不要在这里填/);
+test('Endpoint onboarding is absent and a previously misplaced key stays ignored', async () => {
+  assert.deepEqual(apiMethod(plugin).prompts ?? [], []);
 
   const { calls } = await readUsage(
     { key: 'sk-example', metadata: { endpoint: 'sk-example' } },
