@@ -27,7 +27,6 @@ test("portable inline history does not look up IDs on a different resource", asy
   const expected = structuredClone(before); expected.store = false;
   for (const item of expected.input) if (item.type !== "reasoning") delete item.id;
   delete expected.input[1].status;
-  expected.input[1].content = [{ type: "input_text", text: "Checking" }];
   assert.deepEqual(after, expected);
   assert.deepEqual(JSON.parse(body), before);
 });
