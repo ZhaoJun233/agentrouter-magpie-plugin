@@ -1,0 +1,7 @@
+# Workflow and security-sensitive changes require maintainer review.
+* @ZhaoJun233
+/.github/ @ZhaoJun233
+/request.mjs @ZhaoJun233
+/session.mjs @ZhaoJun233
+/github-cookie.mjs @ZhaoJun233
+/content-filter.mjs @ZhaoJun233

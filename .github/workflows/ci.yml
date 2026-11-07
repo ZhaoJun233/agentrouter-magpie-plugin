@@ -1,0 +1,47 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@6044e13b5dc448c55e2357c8f8041765b8f6011 # v6
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@a309ff8b408cc051a83e09e8b5da17c2b1c9b11 # v6
+        with:
+          python-version: '3.12'
+      # No install scripts, real credentials, gateway calls or account sign-ins.
+      - run: npm test
+      - run: npm run test:policy
+      - run: python set-ar-headers.test.py
+      - run: npm pack --dry-run
+  gate:
+    name: CI gate
+    if: ${{ always() }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every matrix test to pass
+        env:
+          RESULT: ${{ needs.test.result }}
+        run: test "$RESULT" = success

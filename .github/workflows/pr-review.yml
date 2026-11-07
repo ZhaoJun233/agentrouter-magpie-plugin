@@ -1,0 +1,42 @@
+name: Automated PR review
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Existing PR number to review
+        required: true
+        type: number
+  pull_request_target:
+    branches: [master]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+jobs:
+  review:
+    name: Review metadata
+    if: github.event_name == 'pull_request_target' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Privileged workflow: checkout ONLY the trusted base, never PR head/merge.
+      # Never install PR dependencies, execute PR code, or download PR artifacts.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        with:
+          script: |
+            const { reviewPullRequest } = require('./.github/scripts/pr-policy.cjs');
+            const number = Number(process.env.PR_NUMBER);
+            if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid PR number');
+            context.payload.pull_request = { number };
+            await reviewPullRequest({ github, context, core });

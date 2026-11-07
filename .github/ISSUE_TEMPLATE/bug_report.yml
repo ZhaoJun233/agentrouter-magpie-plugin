@@ -1,0 +1,59 @@
+name: 缺陷报告
+description: 提交可复现的问题；请勿公开安全漏洞或敏感数据。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先查阅 [使用说明](https://github.com/ZhaoJun233/agentrouter-magpie-plugin/blob/master/README.md) 并搜索已有 Issue。
+        安全漏洞请使用 [私密报告渠道](https://github.com/ZhaoJun233/agentrouter-magpie-plugin/security/advisories/new)，不要在此披露。
+  - type: input
+    id: versions
+    attributes:
+      label: 版本与环境
+      description: 插件版本、magpie 版本、Node.js / Python 版本及操作系统；未涉及的组件请注明。
+      placeholder: "插件版本：…；magpie：…；Node.js：…；Python：…；操作系统：…"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现步骤
+      description: 使用合成输入，说明前置条件、相关配置项与稳定复现步骤；不要附真实配置文件或抓包。
+      placeholder: |
+        1. 使用的功能与脱敏配置：
+        2. 操作步骤：
+        3. 出现问题的位置：
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      description: 说明在保留历史状态与认证边界的前提下，应当发生什么。
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 说明错误、发生频率及影响；如版本升级后出现，请注明最后正常版本。
+    validations:
+      required: true
+  - type: textarea
+    id: traces
+    attributes:
+      label: 脱敏日志与验证证据
+      description: 仅保留必要的错误码、脱敏调用轨迹和测试结果。删除 API Key、Cookie、Token、认证头及用户对话；没有日志请说明。
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索已有 Issue，并阅读相关使用说明。
+          required: true
+        - label: 我确认未提交真实凭据、Cookie、Token 或用户对话。
+          required: true

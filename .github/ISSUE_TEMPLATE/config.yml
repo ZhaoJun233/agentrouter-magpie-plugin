@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用说明与常见问题
+    url: https://github.com/ZhaoJun233/agentrouter-magpie-plugin/blob/master/README.md
+    about: 安装、配置与排障请先阅读 README，再提交脱敏的缺陷报告。
+  - name: 私密报告安全漏洞
+    url: https://github.com/ZhaoJun233/agentrouter-magpie-plugin/security/advisories/new
+    about: 请勿在公开 Issue 中披露漏洞细节、凭据或用户对话；入口未开放时请先提醒维护者启用私密渠道。
