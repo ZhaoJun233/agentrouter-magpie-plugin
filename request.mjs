@@ -84,8 +84,9 @@ function replayInline(body) {
     if (item.type === "message" || item.type == null) {
       // Output-message input objects require an ID. Convert to the supported
       // EasyInputMessage form, preserving phase and every actual text segment.
+      // Assistant history keeps output_text and its metadata; other roles use input_text.
       delete item.status;
-      if (Array.isArray(item.content)) item.content = item.content.map(part =>
+      if (item.role !== "assistant" && Array.isArray(item.content)) item.content = item.content.map(part =>
         part.type === "output_text" ? { type: "input_text", text: part.text } : part);
     }
     changed = true;

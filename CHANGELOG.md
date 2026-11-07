@@ -4,6 +4,13 @@
 
 本页记录源码行为，当前版本为 **0.1.6**。npm 可用版本以官方 registry 查询为准；文档和源码更新不代表远程网关升级或模型验证成功。
 
+## 未发布
+
+- 修复 Windows 内置 Administrator 在 CI 中被 `icacls` 记作 `LA`、导致安全目录被误拒绝的问题：使用当前完整 SID 的原生 ACL 往返结果识别身份，保留共享权限拒绝策略和 Linux 权限检查；补充跨平台权限与域 SID 反例测试。
+
+- 修复 Issue #2：完整 assistant 历史内联后保留 `output_text` 及其空 `annotations` / `logprobs`，避免误转 `input_text` 导致上游 400；其他角色、工具调用和认证行为保持不变。
+- 采用 PR #3 的角色区分修复，但不引入其 reasoning 状态裁剪：推理 ID、加密内容、仅引用和未知字段继续保留。补充角色、资源切换、安装后 loader 与无损状态回归；合成测试不代表真实上游验证。
+
 ## 0.1.6 — 2026-11-06
 
 - 登录顺序保持 API Key 在前、GitHub 在后。API Key 无插件问题，只用宿主原生单输入；保存不代表验证。当前宿主 API `authorize` 不接收原生 key，因此不添加保存前验证、第二个 key 字段、verified 标记或状态徽章。

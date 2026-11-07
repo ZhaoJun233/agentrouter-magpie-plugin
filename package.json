@@ -6,7 +6,7 @@
   "main": "./index.mjs",
   "scripts": {
     "test:policy": "node --test .github/scripts/pr-policy.test.cjs",
-    "test": "node --test body-inspection.test.mjs usage.test.mjs loader-stream.test.mjs response-bounds.test.mjs checkin.test.mjs local-checkin.test.mjs local-checkin.integration.test.mjs request-replay.test.mjs content-filter.test.mjs auth-guidance.test.mjs auth-flow.test.mjs resource-compat.test.mjs auth-request-boundary.test.mjs response-preservation.test.mjs",
+    "test": "node --test body-inspection.test.mjs usage.test.mjs loader-stream.test.mjs response-bounds.test.mjs checkin.test.mjs local-checkin.test.mjs local-checkin.integration.test.mjs windows-acl.test.mjs request-replay.test.mjs content-filter.test.mjs auth-guidance.test.mjs auth-flow.test.mjs resource-compat.test.mjs auth-request-boundary.test.mjs response-preservation.test.mjs",
     "test:headers": "python3 set-ar-headers.test.py"
   },
   "exports": "./index.mjs",
@@ -19,6 +19,7 @@
     "content-filter.mjs",
     "content-filter.example.json",
     "local-checkin.mjs",
+    "windows-acl.mjs",
     "LOCAL-CHECKIN.md",
     "README.md",
     "CHANGELOG.md",

@@ -178,3 +178,28 @@ test("a parent junction cannot redirect local credential storage into a reposito
     await assert.rejects(fs.access(path.join(repository, "private", "github-cookie.txt")));
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+
+test("Linux and Windows reject shared home permissions before network access", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "ar-home-permissions-"));
+  let calls = 0;
+  try {
+    await initialize(home);
+    await status(home);
+    if (process.platform === "win32") {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const icacls = path.join(process.env.SystemRoot || "C:/Windows", "System32", "icacls.exe");
+      await promisify(execFile)(icacls, [home, "/grant", "*S-1-5-32-545:(OI)(CI)R"], { windowsHide: true });
+    } else {
+      assert.equal((await fs.stat(home)).mode & 0o777, 0o700);
+      for (const file of ["config.json", "github-cookie.txt"]) {
+        assert.equal((await fs.stat(path.join(home, file))).mode & 0o777, 0o600);
+      }
+      await fs.chmod(home, 0o755);
+    }
+    const expected = process.platform === "win32" ? "UNSAFE_WINDOWS_PERMISSIONS" : "UNSAFE_HOME_PERMISSIONS";
+    await assert.rejects(status(home), { code: expected });
+    await assert.rejects(runOnce(home, { checkin: async () => { calls++; } }), { code: expected });
+    assert.equal(calls, 0);
+  } finally { await fs.rm(home, { recursive: true, force: true }); }
+});

@@ -287,9 +287,9 @@ AgentRouter 的模型**不支持** `/v1/chat/completions`：
 
 如果上游提示 `The requested item was created under a different ... OpenAI resource`，通常是请求引用了另一个资源创建的服务端条目。这不是内容敏感词，也不是改一次 API Key 就能恢复的历史。
 
-默认开启 `portable-responses`：对 `POST .../responses` 中**带完整内联内容**的普通消息和 function-call / function-call-output，去掉用于条目查找的顶层 `id`。普通输出文本转换为 API 支持的内联输入消息，保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果及嵌套业务 `id` 保持不变。有改写时设置 `store:false`，清除旧正文长度/摘要头。未改写时保留原始正文。实现见 [request.mjs](<request.mjs>)。
+默认开启 `portable-responses`：对 `POST .../responses` 中**带完整内联内容**的普通消息和 function-call / function-call-output，去掉用于条目查找的顶层 `id`。完整 assistant 消息在内联后仍保留 `output_text` 及其空 `annotations` / `logprobs`，不会误转为 `input_text`；其他角色沿用输入文本转换。保留角色、正文和 `phase`；工具的 `call_id`、名称、参数、结果及嵌套业务 `id` 保持不变。有改写时设置 `store:false`，清除旧正文长度/摘要头。未改写时保留原始正文。实现见 [request.mjs](<request.mjs>)。
 
-0.1.4 额外识别普通 `output_text` 中的空 `logprobs: []`（网关可能随完成消息一起输出）。空概率数组没有内容信息，转换为内联输入文本时可以去掉；**非空、`null` 或形状未知的概率数据保持原样**。这类完整消息的顶层 ID 曾因该字段未被识别而保留，合成资源切换回归覆盖了此缺口。
+0.1.4 额外识别普通 `output_text` 中的空 `logprobs: []`（网关可能随完成消息一起输出）。空概率数组不阻碍完整消息内联，assistant 消息内联时仍原样保留该字段；**非空、`null` 或形状未知的概率数据保持原样**。这类完整消息的顶层 ID 曾因该字段未被识别而保留，合成资源切换回归覆盖了此缺口。
 
 边界：
 
