@@ -25,12 +25,12 @@ jobs:
     steps:
       # Privileged workflow: checkout ONLY the trusted base, never PR head/merge.
       # Never install PR dependencies, execute PR code, or download PR artifacts.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
           sparse-checkout: .github/scripts
-      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
         with:
