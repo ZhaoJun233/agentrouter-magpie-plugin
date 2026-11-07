@@ -17,6 +17,8 @@
 
 本插件仍运行在既有宿主中，不新增独立服务、仪表盘、遥测、自动重试、账号切换或有损历史降级。
 
+完整 assistant 消息去掉顶层查找 ID 后，正文仍使用 `output_text` 并保留空注释/概率字段；不得误转为仅适用于其他角色的 `input_text`。此修复不改变 reasoning、引用和未知字段的保留规则，也不承诺不透明状态跨资源可用。
+
 ## 2. 参考来源与独立实现
 
 设计参考 [AgentRouter-Codex-Filter](<https://github.com/alexcarterio/AgentRouter-Codex-Filter>)。参考审阅依据是离线提供的源码 ZIP，其中为 **V12.2 独立 Node.js 代理**；实际服务默认使用 lazy history / streaming，不能把可选的历史清理行为误写成默认行为。归档中的版本信息不等于已核验远端某个提交，本文不作远端提交一致性声明。

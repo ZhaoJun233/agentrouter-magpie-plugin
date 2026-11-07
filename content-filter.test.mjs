@@ -227,7 +227,7 @@ test("request option combinations keep empty-logprobs filtering and replay indep
     const prepared = await prepareRequest(url, init, options);
     const text = textFilter ? "[FILTERED]" : "private-term";
     const expectedMessage = portableResponses
-      ? { type: "message", role: "assistant", phase: "commentary", content: [{ type: "input_text", text }] }
+      ? { type: "message", role: "assistant", phase: "commentary", content: [{ ...message.content[0], text }] }
       : { ...message, content: [{ ...message.content[0], text }] };
     assert.deepEqual(JSON.parse(prepared.body), { input: [expectedMessage], store: !portableResponses }, label);
     if (!portableResponses && !textFilter) assert.equal(prepared, init, label);
@@ -310,7 +310,7 @@ test("installed loader honors all independent options and their enabled defaults
     const text = current["text-filter"] === false ? "private-term" : "[FILTERED]";
     const expectedMessage = current["portable-responses"] === false
       ? { ...message, content: [{ ...message.content[0], text }] }
-      : { type: "message", role: "assistant", content: [{ type: "input_text", text }] };
+      : { type: "message", role: "assistant", content: [{ ...message.content[0], text }] };
     assert.deepEqual(JSON.parse(sent[count].body), { input: [expectedMessage], store: current["portable-responses"] === false }, label);
     if (current["portable-responses"] === false && current["text-filter"] === false) assert.equal(sent[count].body, init.body);
     assert.equal(JSON.parse(init.body).input[0].content[0].text, "private-term", label);

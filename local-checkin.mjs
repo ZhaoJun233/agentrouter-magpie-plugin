@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
+import { currentWindowsTrustee, isPrivateWindowsAcl } from "./windows-acl.mjs";
 
 const DAY = 24 * 60 * 60 * 1000;
 const REPO = path.dirname(fileURLToPath(import.meta.url));
@@ -51,7 +52,14 @@ async function windowsPermissions(home, initialize) {
     // Native signed Windows utilities only; no execution-policy bypass or scripts.
     // /save exports security descriptors, never file contents or credentials.
     temporary = await fs.mkdtemp(path.join(os.tmpdir(), "ar-acl-"));
+    // A native round-trip resolves aliases such as LA for this exact SID only.
+    // Never allow LA globally or infer local identity from a SID suffix.
+    await exec(icacls, [temporary, "/grant:r", "*" + sid + ":(OI)(CI)F", "/inheritance:r"], options);
     const saved = path.join(temporary, "permissions.txt");
+    await exec(icacls, [temporary, "/save", saved], options);
+    const probe = (await fs.readFile(saved, "utf16le")).split(/\r?\n/).find(line => line.startsWith("D:"));
+    const currentTrustee = currentWindowsTrustee(probe);
+    if (!currentTrustee) fail("UNSAFE_WINDOWS_PERMISSIONS");
     const targets = [home];
     for (const name of ["config.json", "github-cookie.txt", "state.json"]) {
       const file = path.join(home, name);
@@ -63,14 +71,7 @@ async function windowsPermissions(home, initialize) {
       await exec(icacls, [target, "/save", saved], options);
       const descriptor = (await fs.readFile(saved, "utf16le")).split(/\r?\n/).find(line => line.startsWith("D:"));
       if (!descriptor) fail("UNSAFE_WINDOWS_PERMISSIONS");
-      let currentUserAllowed = false;
-      for (const match of descriptor.matchAll(/\(([^()]*)\)/g)) {
-        const [type, flags, rights, object, inherited, identity] = match[1].split(";");
-        if (type === "D") continue;
-        if (type !== "A" || object || inherited || ![sid, "BA", "SY", "S-1-5-18", "S-1-5-32-544"].includes(identity)) fail("UNSAFE_WINDOWS_PERMISSIONS");
-        if (identity === sid && rights === "FA" && !flags.includes("IO")) currentUserAllowed = true;
-      }
-      if (!currentUserAllowed) fail("UNSAFE_WINDOWS_PERMISSIONS");
+      if (!isPrivateWindowsAcl(descriptor, currentTrustee)) fail("UNSAFE_WINDOWS_PERMISSIONS");
     }
   } catch { fail("UNSAFE_WINDOWS_PERMISSIONS"); }
   finally { if (temporary) await fs.rm(temporary, { recursive: true, force: true }); }
