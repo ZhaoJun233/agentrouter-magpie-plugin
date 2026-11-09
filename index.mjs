@@ -187,7 +187,7 @@ function apiBase(provider, auth) {
   if (isURLish(said)) return `${said.replace(/\/+$/, "")}/v1`;
   const base = String(meta(auth, "apiBase") ?? "").trim();
   if (base) return base.replace(/\/+$/, "");
-  return `${siteOf(siteName(auth)).api}/v1`;
+  return `${ENDPOINT}/v1`;
 }
 
 // siteBase is where the site's own web routes are: the balance and the
@@ -322,6 +322,11 @@ async function jsonOrText(res) {
 // matches a callback against a subdirectory of the registered URL, and the
 // site's own token exchange does not send redirect_uri at all, so the URL
 // used here only has to survive the authorize step.
+//
+// LinuxDo has the same SPA behaviour: /oauth/linuxdo is a route that redeems
+// the code on load, then navigates away, so the address bar no longer carries
+// code/state for manual copy. The sub-path /oauth/linuxdo/magpie avoids that
+// route the same way GitHub's sub-path does.
 const GITHUB_CALLBACK_PATH = "/oauth/github/magpie";
 const LINUXDO_CALLBACK_PATH = "/oauth/linuxdo/magpie";
 const LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize";
@@ -456,7 +461,7 @@ async function redeemGithub(base, code, state, inputs) {
   u.searchParams.set("code", code);
   u.searchParams.set("state", state);
   u.searchParams.set("mode", "login");
-  const res = await fetch(u, { headers: DEFAULT_HEADERS, redirect: "manual", signal: withTimeout(REQUEST_TIMEOUT) });
+  const res = await fetch(u, { headers, redirect: "manual", signal: withTimeout(REQUEST_TIMEOUT) });
   const session = sessionOf(res);
   const { json } = await jsonOrText(res);
   const d = json?.data;
@@ -483,6 +488,7 @@ async function redeemGithub(base, code, state, inputs) {
     metadata: {
       site: base === SITES.air.site ? "air" : "org",
       provider,
+      ...(base === SITES.air.site ? { apiBase: `${SITES.air.api}/v1` } : {}),
       accessToken: token,
       userId: String(d.id),
       ...(session ? { cookie: "session=" + session } : {}),
@@ -979,7 +985,16 @@ export const AgentRouterAuthPlugin = async (input) => {
           // The current host owns the one native Key input and saves it.
           // Its authorize callback does not receive that Key for validation.
           ...(input?.magpie ? {
-            authorize: async (inputs) => ({ type: "success", metadata: { site: siteOf(inputs?.site) === SITES.air ? "air" : "org" } }),
+            authorize: async (inputs) => {
+              const site = siteOf(inputs?.site) === SITES.air ? "air" : "org";
+              return {
+                type: "success",
+                metadata: {
+                  site,
+                  ...(site === "air" ? { apiBase: `${SITES.air.api}/v1` } : {}),
+                },
+              };
+            },
           } : {}),
           prompts: [
             {
@@ -1077,7 +1092,7 @@ export const AgentRouterAuthPlugin = async (input) => {
               return { type: "failed", error: "无法获取 LinuxDo 授权配置，请检查网络或站点验证后重试，也可改用 API Key 接入。" };
             }
             const u = new URL(LINUXDO_AUTHORIZE_URL);
-            const redirectUri = `${cfg.origin}/oauth/linuxdo`;
+            const redirectUri = `${cfg.origin}${LINUXDO_CALLBACK_PATH}`;
             u.searchParams.set("client_id", cfg.linuxdoId);
             u.searchParams.set("redirect_uri", redirectUri);
             u.searchParams.set("response_type", "code");

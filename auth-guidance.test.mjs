@@ -51,7 +51,7 @@ test("API finalization is local and leaves the host as sole key owner", async ()
     const inputs = { site: "air", githubCookie: "synthetic-private", accessToken: "synthetic-access" };
     const before = structuredClone(inputs);
     const result = await method.authorize(inputs);
-    assert.deepEqual(result, { type: "success", metadata: { site: "air" } });
+    assert.deepEqual(result, { type: "success", metadata: { site: "air", apiBase: "https://ps.air-outer.com/v1" } });
     assert.ok(!Object.hasOwn(result, "key"));
     assert.ok(!Object.hasOwn(result, "verified"));
     assert.deepEqual(inputs, before);
@@ -102,7 +102,7 @@ test("OAuth captures only its token and saves a usable model key plus site sessi
     const result = await flow.callback(callback);
     assert.equal(result.type, "success");
     assert.equal(result.key, "synthetic-api-key");
-    assert.deepEqual(result.metadata, { site: "air", provider: "github", accessToken: "synthetic-access", userId: "42", cookie: "session=synthetic-site" });
+    assert.deepEqual(result.metadata, { site: "air", provider: "github", apiBase: "https://ps.air-outer.com/v1", accessToken: "synthetic-access", userId: "42", cookie: "session=synthetic-site" });
     assert.ok(calls.every(c => c.url.startsWith("https://ps.air-outer.com/")));
     assert.ok(calls.every(c => !new Headers(c.init.headers).has("Cookie")));
     assert.equal(new Headers(calls[3].init.headers).get("Authorization"), "synthetic-access");
