@@ -389,7 +389,7 @@ async function siteAuthConfig(base) {
     const { json } = await jsonOrText(res);
     const id = typeof json?.data?.github_client_id === "string" ? json.data.github_client_id.trim() : "";
     const linuxdoId = typeof json?.data?.linuxdo_client_id === "string" ? json.data.linuxdo_client_id.trim() : "";
-    if (!res.ok || !id) return { ok: false, why: "站点没有开启 GitHub 登录" };
+    if (!res.ok || (!id && !linuxdoId)) return { ok: false, why: "站点没有开启 GitHub 或 LinuxDo 登录" };
     const reported = json.data.server_address;
     if (reported != null && typeof reported !== "string") return { ok: false, why: "站点回调地址无效" };
     const url = new URL(String(reported ?? "").trim() || base);
