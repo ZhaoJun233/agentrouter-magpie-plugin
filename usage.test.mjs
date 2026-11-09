@@ -47,7 +47,7 @@ test('GitHub login saves the entered token and never regenerates it', async () =
 });
 
 test('Endpoint onboarding is absent and a previously misplaced key stays ignored', async () => {
-  assert.deepEqual(apiMethod(plugin).prompts ?? [], []);
+  assert.deepEqual(apiMethod(plugin).prompts.map(p => p.key), ["site"]);
 
   const { calls } = await readUsage(
     { key: 'sk-example', metadata: { endpoint: 'sk-example' } },
