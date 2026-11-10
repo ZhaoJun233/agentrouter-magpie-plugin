@@ -2,9 +2,15 @@
 
 [使用说明](<README.md>) · [优化设计与兼容边界](<docs/OPTIMIZATION.md>)
 
-本页记录源码行为，当前版本为 **0.1.6**。npm 可用版本以官方 registry 查询为准；文档和源码更新不代表远程网关升级或模型验证成功。
+本页记录源码行为，当前版本为 **0.1.7**。npm 可用版本以官方 registry 查询为准；文档和源码更新不代表远程网关升级或模型验证成功。
 
-## 未发布
+## 0.1.7 — 2026-11-10
+
+- 新增国际站 `agentrouter.org` / 国内站 `ps.air-outer.com` 选择，登录顺序为 API Key、GitHub、LinuxDo。API Key 保留宿主原生单密钥输入；GitHub / LinuxDo 选择站点后填写系统访问令牌，使用浏览器授权及完整手动回调查找已有模型 key。
+- 新国内站授权显式保存 `metadata.apiBase`，模型请求和模型列表使用所选站点。旧账号的 key、site、显式 endpoint / apiBase 保留，不将旧 `site: air` 自动迁移为国内模型端点。
+- OAuth 兑换实际发送 state 接口下发的站点 session；两种提供商独立校验各自 client ID。LinuxDo 使用 `/oauth/linuxdo/magpie` 回调，保存提供商标识；未新增 LinuxDo Cookie 自动登录或签到续期机制。
+- LinuxDo 回调流程的合成回归通过，但未进行真实账号 OAuth 实测；回调被拒绝或无法完成时可使用 API Key 接入。此次本地验证覆盖 297 项 Node.js、13 项 policy、2 项 Python，另有 38 项独立合成回归；这些结果不代表线上授权或模型调用已验证。
+- npm 安装示例与登录、端点兼容、升级回退文档同步到 0.1.7。相关变更见 PR #9、Issue #10。
 
 - 修复 Windows 内置 Administrator 在 CI 中被 `icacls` 记作 `LA`、导致安全目录被误拒绝的问题：使用当前完整 SID 的原生 ACL 往返结果识别身份，保留共享权限拒绝策略和 Linux 权限检查；补充跨平台权限与域 SID 反例测试。
 
