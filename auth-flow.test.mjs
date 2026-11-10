@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import plugin from "./index.mjs";
 
-test("onboarding keeps native API Key input and only the GitHub system-token prompt", async () => {
+test("onboarding keeps native API Key input and asks for site plus system token", async () => {
   const p = await plugin({ magpie: {} });
-  assert.deepEqual(p.auth.methods.map(m => m.type), ["api", "oauth"]);
-  assert.deepEqual(p.auth.methods[0].prompts ?? [], []);
-  assert.deepEqual(p.auth.methods[1].prompts.map(p => p.key), ["accessToken"]);
-  assert.equal(p.auth.methods[1].prompts[0].type, "password");
+  assert.deepEqual(p.auth.methods.map(m => m.type), ["api", "oauth", "oauth"]);
+  assert.deepEqual(p.auth.methods[0].prompts.map(p => p.key), ["site"]);
+  for (const oauth of p.auth.methods.filter(m => m.type === "oauth")) {
+    assert.deepEqual(oauth.prompts.map(p => p.key), ["site", "accessToken"]);
+    assert.equal(oauth.prompts[1].type, "password");
+  }
 });
 
 test("missing model Key fails locally without forwarding SDK placeholder or management credentials", async t => {

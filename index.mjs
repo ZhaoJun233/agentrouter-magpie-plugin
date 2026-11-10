@@ -322,7 +322,14 @@ async function jsonOrText(res) {
 // matches a callback against a subdirectory of the registered URL, and the
 // site's own token exchange does not send redirect_uri at all, so the URL
 // used here only has to survive the authorize step.
+//
+// LinuxDo has the same SPA behaviour: /oauth/linuxdo is a route that redeems
+// the code on load, then navigates away, so the address bar no longer carries
+// code/state for manual copy. The sub-path /oauth/linuxdo/magpie avoids that
+// route the same way GitHub's sub-path does.
 const GITHUB_CALLBACK_PATH = "/oauth/github/magpie";
+const LINUXDO_CALLBACK_PATH = "/oauth/linuxdo/magpie";
+const LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize";
 
 // Login accepts only a full callback URL belonging to this flow.
 function githubCallbackCode(pasted, expectedURL, state) {
@@ -360,7 +367,8 @@ async function oauthState(base) {
     const { json } = await jsonOrText(res);
     const st = typeof json?.data === "string" ? json.data.trim() : "";
     if (!res.ok || json?.success !== true || !st) return { ok: false, why: "站点没有下发 OAuth state" };
-    return { ok: true, state: st };
+    const stateCookie = sessionOf(res);
+    return { ok: true, state: st, stateCookie };
   } catch (e) {
     return { ok: false, why: `拿不到 OAuth state：${e?.message ?? String(e)}` };
   }
@@ -380,7 +388,8 @@ async function siteAuthConfig(base) {
     });
     const { json } = await jsonOrText(res);
     const id = typeof json?.data?.github_client_id === "string" ? json.data.github_client_id.trim() : "";
-    if (!res.ok || !id) return { ok: false, why: "站点没有开启 GitHub 登录" };
+    const linuxdoId = typeof json?.data?.linuxdo_client_id === "string" ? json.data.linuxdo_client_id.trim() : "";
+    if (!res.ok || (!id && !linuxdoId)) return { ok: false, why: "站点没有开启 GitHub 或 LinuxDo 登录" };
     const reported = json.data.server_address;
     if (reported != null && typeof reported !== "string") return { ok: false, why: "站点回调地址无效" };
     const url = new URL(String(reported ?? "").trim() || base);
@@ -388,7 +397,7 @@ async function siteAuthConfig(base) {
         !Object.values(SITES).some(site => site.site === url.origin)) {
       return { ok: false, why: "站点回调地址不受信任" };
     }
-    return { ok: true, id, origin: url.origin };
+    return { ok: true, id, linuxdoId, origin: url.origin };
   } catch (e) {
     return { ok: false, why: `读不到站点配置：${e?.message ?? String(e)}` };
   }
@@ -443,17 +452,21 @@ function sessionOf(res) {
 // system access token explicitly entered before authorization.
 async function redeemGithub(base, code, state, inputs) {
   const token = String(inputs.accessToken ?? "").trim();
+  const provider = inputs.provider === "linuxdo" ? "linuxdo" : "github";
+  const label = provider === "linuxdo" ? "LinuxDo" : "GitHub";
   if (!token) return { type: "failed", error: "缺少系统访问令牌，请重新登录或改用 API Key 接入。" };
-  const u = new URL(base + "/api/oauth/github");
+  const headers = { ...DEFAULT_HEADERS };
+  if (inputs.stateCookie) headers.Cookie = "session=" + inputs.stateCookie;
+  const u = new URL(base + "/api/oauth/" + provider);
   u.searchParams.set("code", code);
   u.searchParams.set("state", state);
   u.searchParams.set("mode", "login");
-  const res = await fetch(u, { headers: DEFAULT_HEADERS, redirect: "manual", signal: withTimeout(REQUEST_TIMEOUT) });
+  const res = await fetch(u, { headers, redirect: "manual", signal: withTimeout(REQUEST_TIMEOUT) });
   const session = sessionOf(res);
   const { json } = await jsonOrText(res);
   const d = json?.data;
   if (!res.ok || json?.success !== true || !d?.id) {
-    return { type: "failed", error: "GitHub 授权兑换未完成，授权码可能已使用或过期；请重新授权或改用 API Key 接入。" };
+    return { type: "failed", error: `${label} 授权兑换未完成，授权码可能已使用或过期；请重新授权或改用 API Key 接入。` };
   }
   const found = await keyOf(base, token, String(d.id));
   if (found.kind !== "found") {
@@ -473,7 +486,9 @@ async function redeemGithub(base, code, state, inputs) {
     type: "success",
     key: found.key,
     metadata: {
-      site: "org",
+      site: base === SITES.air.site ? "air" : "org",
+      provider,
+      ...(base === SITES.air.site ? { apiBase: `${SITES.air.api}/v1` } : {}),
       accessToken: token,
       userId: String(d.id),
       ...(session ? { cookie: "session=" + session } : {}),
@@ -970,8 +985,28 @@ export const AgentRouterAuthPlugin = async (input) => {
           // The current host owns the one native Key input and saves it.
           // Its authorize callback does not receive that Key for validation.
           ...(input?.magpie ? {
-            authorize: async () => ({ type: "success", metadata: { site: "org" } }),
+            authorize: async (inputs) => {
+              const site = siteOf(inputs?.site) === SITES.air ? "air" : "org";
+              return {
+                type: "success",
+                metadata: {
+                  site,
+                  ...(site === "air" ? { apiBase: `${SITES.air.api}/v1` } : {}),
+                },
+              };
+            },
           } : {}),
+          prompts: [
+            {
+              type: "select",
+              key: "site",
+              message: "选择站点（国际站 / 国内站）",
+              options: [
+                { value: "org", label: "国际站 agentrouter.org" },
+                { value: "air", label: "国内站 ps.air-outer.com" },
+              ],
+            },
+          ],
         },
         {
           type: "oauth",
@@ -979,12 +1014,14 @@ export const AgentRouterAuthPlugin = async (input) => {
           authorize: async (inputs) => {
             const token = String(inputs?.accessToken ?? "").trim();
             if (!token) return { type: "failed", error: "请输入系统访问令牌；如已有模型 Key，请改用 API Key 接入。" };
-            const selected = SITES.org;
+            const selected = siteOf(inputs?.site);
             let state, cfg;
+            let stateCookie = "";
             try {
               const st = await oauthState(selected.site);
               if (!st.ok || typeof st.state !== "string" || !st.state.trim()) throw new Error("invalid OAuth state");
               state = st.state;
+              stateCookie = st.stateCookie ?? "";
               cfg = await siteAuthConfig(selected.site);
               if (!cfg.ok || !cfg.id) throw new Error("invalid OAuth configuration");
             } catch {
@@ -1010,7 +1047,7 @@ export const AgentRouterAuthPlugin = async (input) => {
                   return { type: "failed", error: "回调地址无效或 state 不匹配。请重新登录获得新链接，再粘贴完整回调地址。" };
                 }
                 try {
-                  return await redeemGithub(selected.site, cb, state, { accessToken: token });
+                  return await redeemGithub(selected.site, cb, state, { accessToken: token, stateCookie });
                 } catch {
                   return { type: "failed", error: "GitHub 授权兑换请求失败或超时，请重新授权重试或改用 API Key 接入。" };
                 }
@@ -1018,6 +1055,80 @@ export const AgentRouterAuthPlugin = async (input) => {
             };
           },
           prompts: [
+            {
+              type: "select",
+              key: "site",
+              message: "选择站点（国际站 / 国内站）",
+              options: [
+                { value: "org", label: "国际站 agentrouter.org" },
+                { value: "air", label: "国内站 ps.air-outer.com" },
+              ],
+            },
+            {
+              type: "password",
+              key: "accessToken",
+              message: "系统访问令牌（AgentRouter 个人设置 → 访问令牌；不是模型 API Key）",
+              validate: value => String(value ?? "").trim() ? undefined : "请输入系统访问令牌；如已有模型 Key，请改用 API Key 入口",
+            },
+          ],
+        },
+        {
+          type: "oauth",
+          label: "LinuxDo（需系统访问令牌）",
+          authorize: async (inputs) => {
+            const token = String(inputs?.accessToken ?? "").trim();
+            if (!token) return { type: "failed", error: "请输入系统访问令牌；如已有模型 Key，请改用 API Key 接入。" };
+            const selected = siteOf(inputs?.site);
+            let state, cfg;
+            let stateCookie = "";
+            try {
+              const st = await oauthState(selected.site);
+              if (!st.ok || typeof st.state !== "string" || !st.state.trim()) throw new Error("invalid OAuth state");
+              state = st.state;
+              stateCookie = st.stateCookie ?? "";
+              cfg = await siteAuthConfig(selected.site);
+              if (!cfg.ok || !cfg.linuxdoId) throw new Error("invalid OAuth configuration");
+            } catch {
+              return { type: "failed", error: "无法获取 LinuxDo 授权配置，请检查网络或站点验证后重试，也可改用 API Key 接入。" };
+            }
+            const u = new URL(LINUXDO_AUTHORIZE_URL);
+            const redirectUri = `${cfg.origin}${LINUXDO_CALLBACK_PATH}`;
+            u.searchParams.set("client_id", cfg.linuxdoId);
+            u.searchParams.set("redirect_uri", redirectUri);
+            u.searchParams.set("response_type", "code");
+            u.searchParams.set("scope", "user");
+            u.searchParams.set("state", state);
+            return {
+              url: u.href,
+              method: "code",
+              instructions: "若未自动打开浏览器，请手动打开链接并完成 LinuxDo 授权。完成后会回到登录成功页，请复制地址栏的完整回调地址并粘贴回来，保留 code 和 state。授权码一次有效，失效后请重新登录。插件只查找已有模型 Key；失败时可改用 API Key 接入。请勿将回调地址发到聊天或日志。",
+              callback: async (value) => {
+                let cb;
+                try {
+                  if (typeof value !== "string" || !value.trim().startsWith("https://")) throw new Error("full callback required");
+                  cb = githubCallbackCode(value, redirectUri, state);
+                  if (!cb) throw new Error("invalid callback");
+                } catch {
+                  return { type: "failed", error: "回调地址无效或 state 不匹配。请重新登录获得新链接，再粘贴完整回调地址。" };
+                }
+                try {
+                  return await redeemGithub(selected.site, cb, state, { accessToken: token, provider: "linuxdo", stateCookie });
+                } catch {
+                  return { type: "failed", error: "LinuxDo 授权兑换请求失败或超时，请重新授权重试或改用 API Key 接入。" };
+                }
+              },
+            };
+          },
+          prompts: [
+            {
+              type: "select",
+              key: "site",
+              message: "选择站点（国际站 / 国内站）",
+              options: [
+                { value: "org", label: "国际站 agentrouter.org" },
+                { value: "air", label: "国内站 ps.air-outer.com" },
+              ],
+            },
             {
               type: "password",
               key: "accessToken",

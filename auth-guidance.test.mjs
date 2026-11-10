@@ -31,16 +31,18 @@ const oauthResponses = () => [
   raw({ success: true, data: { items: [{ status: 1, key: "synthetic-api-key" }] } }),
 ];
 
-test("first login has no optional settings or duplicate API key input", async () => {
+test("first login collects only the site selection and access token", async () => {
   const p = await plugin({ magpie: {} });
-  assert.deepEqual(p.auth.methods.map(m => m.type), ["api", "oauth"]);
-  assert.deepEqual(methodOf(p, "api").prompts ?? [], []);
-  const prompts = methodOf(p, "oauth").prompts;
-  assert.deepEqual(prompts.map(p => p.key), ["accessToken"]);
-  assert.equal(prompts[0].type, "password");
-  assert.equal(prompts[0].validate("synthetic-access"), undefined);
-  assert.ok(prompts[0].validate(" "));
-  assert.match(prompts[0].message, /不是模型 API Key/);
+  assert.deepEqual(p.auth.methods.map(m => m.type), ["api", "oauth", "oauth"]);
+  assert.deepEqual(methodOf(p, "api").prompts.map(p => p.key), ["site"]);
+  for (const oauth of p.auth.methods.filter(m => m.type === "oauth")) {
+    assert.deepEqual(oauth.prompts.map(p => p.key), ["site", "accessToken"]);
+  }
+  const prompts = p.auth.methods.find(m => m.type === "oauth").prompts;
+  assert.equal(prompts[1].type, "password");
+  assert.equal(prompts[1].validate("synthetic-access"), undefined);
+  assert.ok(prompts[1].validate(" "));
+  assert.match(prompts[1].message, /不是模型 API Key/);
 });
 
 test("API finalization is local and leaves the host as sole key owner", async () => {
@@ -49,7 +51,7 @@ test("API finalization is local and leaves the host as sole key owner", async ()
     const inputs = { site: "air", githubCookie: "synthetic-private", accessToken: "synthetic-access" };
     const before = structuredClone(inputs);
     const result = await method.authorize(inputs);
-    assert.deepEqual(result, { type: "success", metadata: { site: "org" } });
+    assert.deepEqual(result, { type: "success", metadata: { site: "air", apiBase: "https://ps.air-outer.com/v1" } });
     assert.ok(!Object.hasOwn(result, "key"));
     assert.ok(!Object.hasOwn(result, "verified"));
     assert.deepEqual(inputs, before);
@@ -100,8 +102,8 @@ test("OAuth captures only its token and saves a usable model key plus site sessi
     const result = await flow.callback(callback);
     assert.equal(result.type, "success");
     assert.equal(result.key, "synthetic-api-key");
-    assert.deepEqual(result.metadata, { accessToken: "synthetic-access", userId: "42", site: "org", cookie: "session=synthetic-site" });
-    assert.ok(calls.every(c => c.url.startsWith("https://agentrouter.org/")));
+    assert.deepEqual(result.metadata, { site: "air", provider: "github", apiBase: "https://ps.air-outer.com/v1", accessToken: "synthetic-access", userId: "42", cookie: "session=synthetic-site" });
+    assert.ok(calls.every(c => c.url.startsWith("https://ps.air-outer.com/")));
     assert.ok(calls.every(c => !new Headers(c.init.headers).has("Cookie")));
     assert.equal(new Headers(calls[3].init.headers).get("Authorization"), "synthetic-access");
   });
