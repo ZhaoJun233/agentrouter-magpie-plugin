@@ -4,12 +4,13 @@
 
 本页记录源码行为，当前版本为 **0.1.8**。npm 可用版本以官方 registry 查询为准；文档和源码更新不代表远程网关升级或模型验证成功。
 
-## 0.1.8 — 未发布
+## 0.1.8 — 2026-11-10
 
 - 新增第三种登录方式「系统访问令牌（读取已有 Key）」：站点 + 系统访问令牌 + 用户 ID + 可选模型 Key ID，只读取账号已有 Key，不请求 OAuth 授权接口，也不创建、轮换或修改任何 Key。
 - 多把启用 Key 时要求用户按站点「令牌」页 ID 列的 Key ID 指定一把，经 `GET /api/token/{id}` 只读读取；唯一启用且完整的 Key 时直接使用，其余分类沿用既有失败文案。Key ID 是该站点对用户可见的数字列，不是隐藏字段。
+- 模型 Key ID 在表单、授权入口和请求函数中统一校验；非法值在发出请求前拒绝，留空与合法数字 ID 的行为保持不变。
 - 移除 0.1.7 的 LinuxDo OAuth 登录入口，含其常量、`/api/status` 的 `linuxdo_client_id` 读取与死代码 `codeOf`。真实验证结论：授权回落到站点注册路由 `https://agentrouter.org/oauth/linuxdo`（非 `/oauth/linuxdo/magpie`），站点前端在该路由自行请求 `/api/oauth/linuxdo`（真实验证记录 1 次、HTTP 403）并跳走，地址栏不保留 code/state，插件侧手动回填在任何兑换请求前即被拒绝；公开资料无 redirect_uri 匹配规则，站点前端确认该路由精确匹配且无可抑制自动兑换的标志位。
-- GitHub 登录链路与提问形状不变；`/api/oauth/*` 仅由 GitHub 授权链路调用。本地回归 300 项 Node.js、13 项 policy 通过；`npm pack --dry-run` 15 个文件、无凭据。真实账号复测：2 次 `/api/token`、0 次 `/api/oauth`，唯一 Key 与按 Key ID 两条路径均成功且返回 Key 与账号已存 Key 一致。
+- GitHub 登录链路与提问形状不变；`/api/oauth/*` 仅由 GitHub 授权链路调用。PR 作者报告真实账号复测：2 次 `/api/token`、0 次 `/api/oauth`，唯一 Key 与按 Key ID 两条路径均成功且返回 Key 与账号已存 Key 一致。发布验证与限制见优化文档。
 
 ## 0.1.7 — 2026-11-10
 

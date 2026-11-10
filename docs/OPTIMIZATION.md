@@ -69,6 +69,8 @@ loader 对缺失 key 或保留占位 key 在网络前返回本地 `400 agentrout
 
 ### 系统访问令牌：用户 ID + 可选 Key ID，只读取已有 key
 
+模型 Key ID 只接受留空或以非零数字开头的正整数字符串；表单、授权入口与请求函数共用校验规则。即使宿主直接提交登录参数，非法 ID 也会在创建登录流程或发出请求前被拒绝。
+
 新增的第三种方式不使用任何 OAuth 授权码。预置问题为站点、系统访问令牌（password 遮蔽输入）、用户 ID 与可选的模型 Key ID。该站点的用户接口必须同时带系统访问令牌和用户 ID：真实验证中只带令牌的同接口返回 401，因此用户 ID 不能省略。多把 Key 时必须填写 Key ID——该 ID 是站点「令牌」页 ID 列对用户可见的数字列，不是从响应反推的字段。
 
 Key 选择规则：只有一把启用且完整的 Key 时直接使用；填写了 Key ID 时按 `GET /api/token/{id}` 只读读取该把，同一请求用于确认启用、非掩码与未过期；两者都没有唯一答案时失败并提示填写 Key ID，不代选、不补页、不重试。列表读取 `page_size=50`，总数大于返回条数或已达分页上限时按不完整处理。该方式不请求 `/api/oauth/*`，不创建、轮换或修改任何 Key；metadata 只写 `site`、`apiBase`（国内站）、`accessToken`、`userId`。
@@ -259,7 +261,9 @@ Python 命令仅执行维护脚本的测试部分，不调用 Docker。这些回
 
 0.1.7 所用运行时代码在合并前完成 **Node.js 297 项、policy 13 项、Python 2 项**本地回归，另有 38 项独立合成检查，结果见 [PR #9 复审记录](https://github.com/ZhaoJun233/agentrouter-magpie-plugin/pull/9#issuecomment-6761271376)。独立检查不计入仓库 `npm test` 数量，且不证明真实 OAuth 或模型调用成功。0.1.6 历史原生记录为 Node.js 278 项、Python 2 项；后续运行时代码改变须重新验证，不能沿用旧计数。
 
-0.1.8 的本地回归为 **Node.js 300 项、policy 13 项**（`npm test` 与 `npm run test:policy`），`npm pack --dry-run` 15 个文件且不含凭据。真实账号复测在一次人工批准的浏览器调试连接之外不涉及浏览器：2 次 `/api/token` 请求、0 次 `/api/oauth` 请求，唯一 Key 与按 Key ID 两条路径均成功且返回 Key 与账号已存 Key 一致；多 Key/被拒/分页不完整分支由固定数据的本地测试覆盖。模型调用未验证，运行 `magpie provider test agentrouter` 另行确认。
+0.1.8 发布前在 Windows、Node.js 24.22.1、Python 3.13.12 上完成 **Node.js 302 项、policy 13 项、Python 2 项**本地回归；另有 10 项独立合成检查覆盖旧账号兼容、合法 ID 与非法 ID 零请求。新增仓库回归覆盖两站共 20 个非法 ID 与 12 个合法或留空输入场景；修复前反例失败，修复后通过。`npm pack --dry-run` 15 个文件且不含凭据。
+
+PR 作者报告的真实账号复测为 2 次 `/api/token` 请求、0 次 `/api/oauth` 请求，唯一 Key 与按 Key ID 两条路径均成功且返回 Key 与账号已存 Key 一致；维护者本次独立复核使用合成数据，未重复真实账号登录。多 Key/被拒/分页不完整分支由固定数据的本地测试覆盖。模型调用未验证，运行 `magpie provider test agentrouter` 另行确认。
 
 维护 0.1.8 时还应独立核对三种登录方式的站点选择、各方式凭据必填、state Cookie 透传、新旧账号模型端点兼容、系统访问令牌方式用户 ID 与 Key ID 的读取路径、唯一 key 发现/歧义/分页不完整的手动恢复、无空 key 成功，以及 loader 在缺失或保留占位 key 时网络前本地拒绝。当前宿主不向 API authorize 传入原生 key，不能用合成桩虚构保存前验证能力。
 

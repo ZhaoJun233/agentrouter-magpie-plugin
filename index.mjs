@@ -488,6 +488,7 @@ async function redeemGithub(base, code, state, inputs) {
 
 function keyProblem(kind) {
   const messages = {
+    invalidId: "模型 Key ID 需为纯数字，或留空",
     missing: "未找到启用且完整的模型 Key",
     ambiguous: "存在多个不同的模型 Key，无法确定使用哪一个",
     incomplete: "模型 Key 列表可能不完整，无法确定唯一候选",
@@ -498,6 +499,11 @@ function keyProblem(kind) {
     network: "读取模型 Key 的网络请求失败或超时",
   };
   return messages[kind] ?? "无法读取模型 Key";
+}
+
+function modelKeyIdProblem(value) {
+  const id = String(value ?? "").trim();
+  return !id || /^[1-9][0-9]*$/.test(id) ? undefined : keyProblem("invalidId");
 }
 
 function usableModelKey(value) {
@@ -555,6 +561,7 @@ async function keyOf(base, token, id) {
 // needs exactly one enabled key to be usable without a choice.
 async function storedKeyOf(base, token, id, keyId) {
   const requested = String(keyId ?? "").trim();
+  if (modelKeyIdProblem(requested)) return { kind: "invalidId" };
   try {
     const url = requested ? `${base}/api/token/${requested}` : `${base}/api/token/?p=1&page_size=${MODEL_KEY_PAGE_SIZE}`;
     const res = await fetch(url, {
@@ -1093,6 +1100,8 @@ export const AgentRouterAuthPlugin = async (input) => {
             const userId = String(inputs?.userId ?? "").trim();
             if (!/^[1-9][0-9]*$/.test(userId)) return { type: "failed", error: "用户 ID 需为站点控制台里的纯数字 ID；可在站点「令牌」页请求头 New-Api-User 中查看。" };
             const keyId = String(inputs?.modelKeyId ?? "").trim();
+            const keyIdError = modelKeyIdProblem(keyId);
+            if (keyIdError) return { type: "failed", error: keyIdError };
             const selected = siteOf(inputs?.site);
             const site = selected.site === SITES.air.site ? "air" : "org";
             return {
@@ -1134,10 +1143,7 @@ export const AgentRouterAuthPlugin = async (input) => {
             type: "text",
             key: "modelKeyId",
             message: "模型 Key ID（可选：站点「令牌」页 ID 列的纯数字值）",
-            validate: value => {
-              const id = String(value ?? "").trim();
-              return !id || /^[1-9][0-9]*$/.test(id) ? undefined : "模型 Key ID 需为纯数字，或留空";
-            },
+            validate: modelKeyIdProblem,
           }],
         },
       ],

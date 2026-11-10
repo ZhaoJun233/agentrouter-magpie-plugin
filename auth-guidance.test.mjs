@@ -246,6 +246,46 @@ test("system token sign-in reads the account's keys without a provider code", as
   });
 });
 
+test("system token sign-in rejects invalid Key IDs before creating a flow or making requests", async () => {
+  const p = await plugin({ magpie: {} });
+  const method = systemTokenOf(p);
+  const prompt = method.prompts.find(p => p.key === "modelKeyId");
+  for (const site of ["org", "air"]) {
+    for (const modelKeyId of ["../other", "%2e%2e/other", "9/child", "9?view=all", "9#part", "0", "-1", "1.5", "abc", "９"]) {
+      await stubFetch([], async calls => {
+        assert.ok(prompt.validate(modelKeyId));
+        const result = await method.authorize({ site, accessToken: "synthetic-access", userId: "42", modelKeyId });
+        assert.equal(result.type, "failed", `${site}: invalid Key ID must fail at authorization`);
+        assert.match(hostFailed(result).error, /模型 Key ID/);
+        assert.ok(!hostFailed(result).error.includes("synthetic-access"));
+        assert.equal(result.callback, undefined);
+        assert.equal(result.key, undefined);
+        assert.equal(calls.length, 0);
+      });
+    }
+  }
+});
+
+test("system token sign-in normalizes optional numeric Key IDs", async () => {
+  const p = await plugin({ magpie: {} });
+  const method = systemTokenOf(p);
+  for (const site of ["org", "air"]) {
+    for (const modelKeyId of [undefined, null, "", "   ", " 9 ", 9]) {
+      const requested = String(modelKeyId ?? "").trim();
+      const item = { id: 9, status: 1, key: "synthetic-model-key" };
+      await stubFetch([raw({ success: true, data: requested ? item : { items: [item], total: 1 } })], async calls => {
+        const flow = await method.authorize({ site, accessToken: "synthetic-access", userId: "42", modelKeyId });
+        const result = await flow.callback();
+        assert.equal(result.type, "success");
+        assert.equal(result.key, item.key);
+        assert.equal(calls.length, 1);
+        const origin = site === "air" ? "https://ps.air-outer.com" : "https://agentrouter.org";
+        assert.equal(calls[0].url, origin + (requested ? "/api/token/9" : "/api/token/?p=1&page_size=50"));
+      });
+    }
+  }
+});
+
 test("system token sign-in asks for a Key ID when the account has more than one", async () => {
   const p = await plugin({ magpie: {} });
   const method = systemTokenOf(p);
