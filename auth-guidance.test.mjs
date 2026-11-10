@@ -7,6 +7,8 @@ const valid = "user_session=synthetic-session; logged_in=yes";
 const callback = "https://agentrouter.org/oauth/github/magpie?code=synthetic-code&state=synthetic-state";
 const raw = (body, headers = {}) => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json", ...headers } });
 const methodOf = (p, type) => p.auth.methods.find(m => m.type === type);
+const githubOf = (p) => p.auth.methods[1];
+const systemTokenOf = (p) => p.auth.methods[2];
 // Magpie's failed() adapter consumes error, not message.
 function hostFailed(r) {
   const why = typeof r?.error === "string" ? r.error.trim() : r?.error instanceof Error ? r.error.message : "";
@@ -31,18 +33,28 @@ const oauthResponses = () => [
   raw({ success: true, data: { items: [{ status: 1, key: "synthetic-api-key" }] } }),
 ];
 
-test("first login collects only the site selection and access token", async () => {
+test("first login collects the site selection, the system token and the key choice", async () => {
   const p = await plugin({ magpie: {} });
   assert.deepEqual(p.auth.methods.map(m => m.type), ["api", "oauth", "oauth"]);
   assert.deepEqual(methodOf(p, "api").prompts.map(p => p.key), ["site"]);
-  for (const oauth of p.auth.methods.filter(m => m.type === "oauth")) {
-    assert.deepEqual(oauth.prompts.map(p => p.key), ["site", "accessToken"]);
-  }
-  const prompts = p.auth.methods.find(m => m.type === "oauth").prompts;
-  assert.equal(prompts[1].type, "password");
-  assert.equal(prompts[1].validate("synthetic-access"), undefined);
-  assert.ok(prompts[1].validate(" "));
-  assert.match(prompts[1].message, /不是模型 API Key/);
+  assert.deepEqual(githubOf(p).prompts.map(p => p.key), ["site", "accessToken"]);
+  const token = githubOf(p).prompts[1];
+  assert.equal(token.type, "password");
+  assert.equal(token.validate("synthetic-access"), undefined);
+  assert.ok(token.validate(" "));
+  assert.match(token.message, /不是模型 API Key/);
+  const entry = systemTokenOf(p);
+  assert.deepEqual(entry.prompts.map(p => p.key), ["site", "accessToken", "userId", "modelKeyId"]);
+  assert.equal(entry.prompts[1].type, "password");
+  assert.equal(entry.prompts[2].type, "text");
+  assert.equal(entry.prompts[3].type, "text");
+  assert.equal(entry.prompts[2].validate("42"), undefined);
+  assert.equal(entry.prompts[2].validate(" 7 "), undefined);
+  for (const bad of ["", " ", "0", "42.5", "-1", "1e3", "abc"]) assert.ok(entry.prompts[2].validate(bad), `user id ${bad} accepted`);
+  assert.equal(entry.prompts[3].validate("15"), undefined);
+  assert.equal(entry.prompts[3].validate(""), undefined);
+  assert.equal(entry.prompts[3].validate(" "), undefined);
+  for (const bad of ["0", "1.5", "abc"]) assert.ok(entry.prompts[3].validate(bad), `key id ${bad} accepted`);
 });
 
 test("API finalization is local and leaves the host as sole key owner", async () => {
@@ -94,7 +106,7 @@ test("OAuth configuration failures are safe and never become authorization flows
 });
 
 test("OAuth captures only its token and saves a usable model key plus site session", async () => {
-  const method = methodOf(await plugin(), "oauth");
+  const method = githubOf(await plugin(), "oauth");
   await stubFetch(oauthResponses(), async calls => {
     const inputs = { accessToken: "synthetic-access", githubCookie: valid, site: "air", headers: "X-Private: ignored" };
     const flow = await method.authorize(inputs);
@@ -102,7 +114,7 @@ test("OAuth captures only its token and saves a usable model key plus site sessi
     const result = await flow.callback(callback);
     assert.equal(result.type, "success");
     assert.equal(result.key, "synthetic-api-key");
-    assert.deepEqual(result.metadata, { site: "air", provider: "github", apiBase: "https://ps.air-outer.com/v1", accessToken: "synthetic-access", userId: "42", cookie: "session=synthetic-site" });
+    assert.deepEqual(result.metadata, { site: "air", apiBase: "https://ps.air-outer.com/v1", accessToken: "synthetic-access", userId: "42", cookie: "session=synthetic-site" });
     assert.ok(calls.every(c => c.url.startsWith("https://ps.air-outer.com/")));
     assert.ok(calls.every(c => !new Headers(c.init.headers).has("Cookie")));
     assert.equal(new Headers(calls[3].init.headers).get("Authorization"), "synthetic-access");
@@ -110,7 +122,7 @@ test("OAuth captures only its token and saves a usable model key plus site sessi
 });
 
 test("OAuth bare codes and exchange network errors fail safely", async () => {
-  const method = methodOf(await plugin(), "oauth");
+  const method = githubOf(await plugin());
   await stubFetch(oauthResponses().slice(0, 2), async calls => {
     const flow = await method.authorize({ accessToken: "synthetic-access" });
     assert.equal((await flow.callback("synthetic-code")).type, "failed");
@@ -151,8 +163,8 @@ test("Cookie validation observes the exact UTF-8 byte limit", async () => {
   assert.equal(typeof validate("user_session=" + "x".repeat(32769 - "user_session=".length)), "string");
 });
 
-test("OAuth guidance and callback errors explain next steps without leaking input", async () => {
-  const method = methodOf(await plugin(), "oauth");
+test("OAuth guidance and callback errors explain next steps without leaking inputs", async () => {
+  const method = githubOf(await plugin());
   await stubFetch(oauthResponses().slice(0, 2), async calls => {
     const flow = await method.authorize({ site: "org", accessToken: "synthetic-access" });
     for (const phrase of ["未自动", "页面未找到", "完整", "刷新"]) assert.ok(flow.instructions.includes(phrase));
@@ -167,7 +179,7 @@ test("OAuth guidance and callback errors explain next steps without leaking inpu
 });
 
 test("OAuth callback rejects foreign, ambiguous, and malformed URLs without exchanging", async () => {
-  const method = methodOf(await plugin(), "oauth");
+  const method = githubOf(await plugin());
   const root = "https://agentrouter.org/oauth/github/magpie";
   const query = "?code=synthetic-code&state=synthetic-state";
   const invalid = [
@@ -193,7 +205,7 @@ test("OAuth callback rejects foreign, ambiguous, and malformed URLs without exch
 });
 
 test("OAuth exchange failure does not echo upstream code or session material", async () => {
-  const method = methodOf(await plugin(), "oauth");
+  const method = githubOf(await plugin());
   await stubFetch([...oauthResponses().slice(0, 2), raw({ success: false, message: "synthetic-private code expired" })], async () => {
     const flow = await method.authorize({ accessToken: "synthetic-access" });
     const result = await flow.callback(callback);
@@ -201,5 +213,93 @@ test("OAuth exchange failure does not echo upstream code or session material", a
     assert.ok(!hostFailed(result).error.includes("synthetic-private"));
     assert.match(hostFailed(result).error, /重新/);
     assert.match(hostFailed(result).error, /过期|失效|一次/);
+  });
+});
+
+test("system token sign-in reads the account's keys without a provider code", async () => {
+  const p = await plugin({ magpie: {} });
+  const method = systemTokenOf(p);
+  for (const inputs of [{ site: "air", accessToken: "synthetic-access" }, { site: "air", accessToken: "synthetic-access", userId: "0" }, { site: "air", accessToken: "synthetic-access", userId: "  " }]) {
+    await stubFetch([], async calls => {
+      const result = await method.authorize(inputs);
+      assert.equal(result.type, "failed");
+      assert.equal(calls.length, 0);
+    });
+  }
+  await stubFetch([raw({ success: true, data: { items: [{ status: 1, key: "synthetic-model-key" }], total: 1 } })], async calls => {
+    const flow = await method.authorize({ site: "air", accessToken: "synthetic-access", userId: "42" });
+    assert.equal(flow.method, "auto");
+    assert.ok(!new URL(flow.url).searchParams.has("code"));
+    const result = await flow.callback(undefined);
+    assert.equal(result.type, "success");
+    assert.equal(result.key, "synthetic-model-key");
+    assert.deepEqual(result.metadata, {
+      site: "air",
+      apiBase: "https://ps.air-outer.com/v1",
+      accessToken: "synthetic-access",
+      userId: "42",
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://ps.air-outer.com/api/token/?p=1&page_size=50");
+    assert.equal(new Headers(calls[0].init.headers).get("Authorization"), "synthetic-access");
+    assert.equal(new Headers(calls[0].init.headers).get("New-Api-User"), "42");
+  });
+});
+
+test("system token sign-in asks for a Key ID when the account has more than one", async () => {
+  const p = await plugin({ magpie: {} });
+  const method = systemTokenOf(p);
+  await stubFetch([raw({ success: true, data: { items: [
+    { id: 7, status: 1, key: "synthetic-one" },
+    { id: 9, status: 1, key: "synthetic-two" },
+  ], total: 2 } })], async calls => {
+    const flow = await method.authorize({ site: "org", accessToken: "synthetic-access", userId: "3" });
+    const result = await flow.callback();
+    assert.equal(result.type, "failed");
+    assert.match(hostFailed(result).error, /模型 Key ID/);
+    assert.equal(calls.length, 1);
+  });
+  await stubFetch([raw({ success: true, data: { id: 9, status: 1, key: "synthetic-two" } })], async calls => {
+    const flow = await method.authorize({ site: "org", accessToken: "synthetic-access", userId: "3", modelKeyId: "9" });
+    const result = await flow.callback();
+    assert.equal(result.type, "success");
+    assert.equal(result.key, "synthetic-two");
+    assert.equal(calls.length, 1, "a named id reads that key alone");
+    assert.equal(calls[0].url, "https://agentrouter.org/api/token/9");
+    assert.deepEqual(result.metadata, { site: "org", accessToken: "synthetic-access", userId: "3" });
+  });
+  await stubFetch([raw({ success: true, data: { id: 9, status: 2, key: "synthetic-disabled" } })], async calls => {
+    const flow = await method.authorize({ site: "org", accessToken: "synthetic-access", userId: "3", modelKeyId: "9" });
+    assert.equal((await flow.callback()).type, "failed");
+    assert.equal(calls.length, 1);
+  });
+});
+
+test("system token sign-in failures never echo the token or save a key", async () => {
+  const p = await plugin({ magpie: {} });
+  const method = systemTokenOf(p);
+  for (const [response, said] of [
+    [raw({ success: true, data: { items: [] } }), "未找到"],
+    [raw({ success: true, data: { items: [{ status: 1, key: "agentrouter" }] } }), "未找到"],
+    [raw({ success: false, message: "synthetic-private token rejected" }), "拒绝"],
+    [new Response("too many requests", { status: 429 }), "暂时"],
+    [new Response("<html>synthetic-private</html>", { status: 403 }), "验证页"],
+  ]) {
+    await stubFetch([response], async calls => {
+      const flow = await method.authorize({ site: "air", accessToken: "synthetic-access", userId: "42" });
+      const result = await flow.callback();
+      assert.equal(result.type, "failed");
+      assert.match(hostFailed(result).error, new RegExp(said));
+      assert.ok(!hostFailed(result).error.includes("synthetic-private"));
+      assert.ok(!hostFailed(result).error.includes("synthetic-access"));
+      assert.equal(calls.length, 1);
+    });
+  }
+  await stubFetch([new Error("synthetic-private boom")], async calls => {
+    const flow = await method.authorize({ site: "air", accessToken: "synthetic-access", userId: "42" });
+    const result = await flow.callback();
+    assert.equal(result.type, "failed");
+    assert.ok(!hostFailed(result).error.includes("synthetic-private"));
+    assert.equal(calls.length, 1);
   });
 });
