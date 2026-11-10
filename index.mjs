@@ -64,6 +64,10 @@ const DEFAULT_HEADERS = {
   Accept: "application/json",
 };
 
+// How many model keys one list read covers. A count at the page size means
+// the list was cut, not that the account has that many.
+const MODEL_KEY_PAGE_SIZE = 50;
+
 // Models are listed by the vendor, so this is only what to show before a
 // sign-in and the shape (limits, tool calls) each listed model takes.
 const MODEL_SHAPE = {
@@ -100,6 +104,26 @@ const REQUEST_TIMEOUT = 30_000;
 const CHECKIN_TIMEOUT = 25_000;
 
 const siteOf = (id) => SITES[id] ?? SITES.org;
+
+// Two of the three sign-in methods ask these first, so they are named once.
+// The host reads them the way the plugin's own prompts gave them: the site
+// pick first, then the system access token that is not a model Key.
+const SITE_PROMPT = {
+  type: "select",
+  key: "site",
+  message: "选择站点（国际站 / 国内站）",
+  options: [
+    { value: "org", label: "国际站 agentrouter.org" },
+    { value: "air", label: "国内站 ps.air-outer.com" },
+  ],
+};
+
+const ACCESS_TOKEN_PROMPT = {
+  type: "password",
+  key: "accessToken",
+  message: "系统访问令牌（AgentRouter 个人设置 → 访问令牌；不是模型 API Key）",
+  validate: value => String(value ?? "").trim() ? undefined : "请输入系统访问令牌；如已有模型 Key，请改用 API Key 入口",
+};
 
 function withTimeout(ms) {
   return AbortSignal.timeout(ms);
@@ -323,13 +347,12 @@ async function jsonOrText(res) {
 // site's own token exchange does not send redirect_uri at all, so the URL
 // used here only has to survive the authorize step.
 //
-// LinuxDo has the same SPA behaviour: /oauth/linuxdo is a route that redeems
-// the code on load, then navigates away, so the address bar no longer carries
-// code/state for manual copy. The sub-path /oauth/linuxdo/magpie avoids that
-// route the same way GitHub's sub-path does.
+// No other provider gets the same treatment: every other site the vendor
+// runs signs in inside its own app, which spends the code on the callback
+// route before the address bar can be read (linuxdo-login, verified against
+// the real site's bundle). Nothing here redirects to those routes, so a
+// browser sign-in hands the code to the app, not to this plugin.
 const GITHUB_CALLBACK_PATH = "/oauth/github/magpie";
-const LINUXDO_CALLBACK_PATH = "/oauth/linuxdo/magpie";
-const LINUXDO_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize";
 
 // Login accepts only a full callback URL belonging to this flow.
 function githubCallbackCode(pasted, expectedURL, state) {
@@ -388,8 +411,7 @@ async function siteAuthConfig(base) {
     });
     const { json } = await jsonOrText(res);
     const id = typeof json?.data?.github_client_id === "string" ? json.data.github_client_id.trim() : "";
-    const linuxdoId = typeof json?.data?.linuxdo_client_id === "string" ? json.data.linuxdo_client_id.trim() : "";
-    if (!res.ok || (!id && !linuxdoId)) return { ok: false, why: "站点没有开启 GitHub 或 LinuxDo 登录" };
+    if (!res.ok || !id) return { ok: false, why: "站点没有开启 GitHub 登录" };
     const reported = json.data.server_address;
     if (reported != null && typeof reported !== "string") return { ok: false, why: "站点回调地址无效" };
     const url = new URL(String(reported ?? "").trim() || base);
@@ -397,29 +419,10 @@ async function siteAuthConfig(base) {
         !Object.values(SITES).some(site => site.site === url.origin)) {
       return { ok: false, why: "站点回调地址不受信任" };
     }
-    return { ok: true, id, linuxdoId, origin: url.origin };
+    return { ok: true, id, origin: url.origin };
   } catch (e) {
     return { ok: false, why: `读不到站点配置：${e?.message ?? String(e)}` };
   }
-}
-
-// codeOf pulls the code out of what the user pasted: the whole callback URL
-// (…/oauth/github?code=abc&state=…), or the code alone.
-function codeOf(pasted) {
-  const s = String(pasted ?? "").trim();
-  if (!s) return "";
-  const m = /[?&]code=([^&#\s]+)/.exec(s);
-  if (m) {
-    try {
-      return decodeURIComponent(m[1]);
-    } catch {
-      return m[1];
-    }
-  }
-  // A bare code has no URL around it; anything with spaces or a scheme is
-  // not one.
-  if (/^[A-Za-z0-9_-]{8,}$/.test(s)) return s;
-  return "";
 }
 
 // sessionOf pulls the site's session cookie out of a response. This site
@@ -452,12 +455,10 @@ function sessionOf(res) {
 // system access token explicitly entered before authorization.
 async function redeemGithub(base, code, state, inputs) {
   const token = String(inputs.accessToken ?? "").trim();
-  const provider = inputs.provider === "linuxdo" ? "linuxdo" : "github";
-  const label = provider === "linuxdo" ? "LinuxDo" : "GitHub";
   if (!token) return { type: "failed", error: "缺少系统访问令牌，请重新登录或改用 API Key 接入。" };
   const headers = { ...DEFAULT_HEADERS };
   if (inputs.stateCookie) headers.Cookie = "session=" + inputs.stateCookie;
-  const u = new URL(base + "/api/oauth/" + provider);
+  const u = new URL(base + "/api/oauth/github");
   u.searchParams.set("code", code);
   u.searchParams.set("state", state);
   u.searchParams.set("mode", "login");
@@ -466,28 +467,17 @@ async function redeemGithub(base, code, state, inputs) {
   const { json } = await jsonOrText(res);
   const d = json?.data;
   if (!res.ok || json?.success !== true || !d?.id) {
-    return { type: "failed", error: `${label} 授权兑换未完成，授权码可能已使用或过期；请重新授权或改用 API Key 接入。` };
+    return { type: "failed", error: "GitHub 授权兑换未完成，授权码可能已使用或过期；请重新授权或改用 API Key 接入。" };
   }
   const found = await keyOf(base, token, String(d.id));
   if (found.kind !== "found") {
-    const messages = {
-      missing: "未找到启用且完整的模型 Key",
-      ambiguous: "存在多个不同的模型 Key，无法确定使用哪一个",
-      incomplete: "模型 Key 列表可能不完整，无法确定唯一候选",
-      rejected: "站点拒绝读取模型 Key，请检查系统访问令牌及权限",
-      blocked: "读取模型 Key 时遇到站点验证页",
-      unsupported: "站点返回的模型 Key 列表格式无法确认",
-      upstream: "站点暂时无法提供模型 Key 列表",
-      network: "读取模型 Key 的网络请求失败或超时",
-    };
-    return { type: "failed", error: messages[found.kind] + "。请改用 API Key 接入，或确认后主动重试。" };
+    return { type: "failed", error: keyProblem(found.kind) + "。请改用 API Key 接入，或确认后主动重试。" };
   }
   return {
     type: "success",
     key: found.key,
     metadata: {
       site: base === SITES.air.site ? "air" : "org",
-      provider,
       ...(base === SITES.air.site ? { apiBase: `${SITES.air.api}/v1` } : {}),
       accessToken: token,
       userId: String(d.id),
@@ -496,10 +486,38 @@ async function redeemGithub(base, code, state, inputs) {
   };
 }
 
+function keyProblem(kind) {
+  const messages = {
+    invalidId: "模型 Key ID 需为纯数字，或留空",
+    missing: "未找到启用且完整的模型 Key",
+    ambiguous: "存在多个不同的模型 Key，无法确定使用哪一个",
+    incomplete: "模型 Key 列表可能不完整，无法确定唯一候选",
+    rejected: "站点拒绝读取模型 Key，请检查系统访问令牌及权限",
+    blocked: "读取模型 Key 时遇到站点验证页",
+    unsupported: "站点返回的模型 Key 列表格式无法确认",
+    upstream: "站点暂时无法提供模型 Key 列表",
+    network: "读取模型 Key 的网络请求失败或超时",
+  };
+  return messages[kind] ?? "无法读取模型 Key";
+}
+
+function modelKeyIdProblem(value) {
+  const id = String(value ?? "").trim();
+  return !id || /^[1-9][0-9]*$/.test(id) ? undefined : keyProblem("invalidId");
+}
+
 function usableModelKey(value) {
   if (typeof value !== "string") return false;
   const key = value.trim();
   return key !== "" && !["agentrouter", "your_api_key"].includes(key.toLowerCase()) && !/[*…<>]|\.\.\.|\s/.test(key);
+}
+
+function enabledModelKey(item) {
+  if (item?.status !== 1 || !usableModelKey(item.key)) return null;
+  const expiry = item.expired_time;
+  const now = Date.now() / 1000;
+  if (expiry != null && (typeof expiry !== "number" || !Number.isFinite(expiry) || (expiry !== -1 && expiry <= now))) return null;
+  return item.key.trim();
 }
 
 function selectModelKey(json, pageSize) {
@@ -510,12 +528,9 @@ function selectModelKey(json, pageSize) {
   if (total != null && (!Number.isSafeInteger(total) || total < items.length)) return { kind: "unsupported" };
   if (total != null ? total > items.length : items.length >= pageSize) return { kind: "incomplete" };
   const keys = new Set();
-  const now = Date.now() / 1000;
   for (const item of items) {
-    if (item?.status !== 1 || !usableModelKey(item.key)) continue;
-    const expiry = item.expired_time;
-    if (expiry != null && (typeof expiry !== "number" || !Number.isFinite(expiry) || (expiry !== -1 && expiry <= now))) continue;
-    keys.add(item.key.trim());
+    const key = enabledModelKey(item);
+    if (key) keys.add(key);
   }
   if (keys.size === 0) return { kind: "missing" };
   if (keys.size !== 1) return { kind: "ambiguous" };
@@ -535,6 +550,36 @@ async function keyOf(base, token, id) {
     if (!res.ok) return { kind: "upstream" };
     if (json?.success === false) return { kind: "rejected" };
     return selectModelKey(json, pageSize);
+  } catch {
+    return { kind: "network" };
+  }
+}
+
+// storedKeyOf is the same read for the sign-in that already holds the system
+// token and the user id: no provider code, no login, only the account's own
+// keys. A named Key ID reads that one key on its own; otherwise the account
+// needs exactly one enabled key to be usable without a choice.
+async function storedKeyOf(base, token, id, keyId) {
+  const requested = String(keyId ?? "").trim();
+  if (modelKeyIdProblem(requested)) return { kind: "invalidId" };
+  try {
+    const url = requested ? `${base}/api/token/${requested}` : `${base}/api/token/?p=1&page_size=${MODEL_KEY_PAGE_SIZE}`;
+    const res = await fetch(url, {
+      headers: { ...DEFAULT_HEADERS, Authorization: token, "New-Api-User": id },
+      signal: withTimeout(REQUEST_TIMEOUT),
+    });
+    const { json, text } = await jsonOrText(res);
+    if (!json && /^\s*</.test(text)) return { kind: "blocked" };
+    if (res.status === 401 || res.status === 403) return { kind: "rejected" };
+    if (!res.ok) return { kind: "upstream" };
+    // A list that answers a business failure is a credential the site refuses;
+    // a named id that answers one simply is not this account's key.
+    if (json?.success === false) return requested ? { kind: "missing" } : { kind: "rejected" };
+    if (requested) {
+      const key = enabledModelKey(json?.data);
+      return key ? { kind: "found", key } : { kind: "missing" };
+    }
+    return selectModelKey(json, MODEL_KEY_PAGE_SIZE);
   } catch {
     return { kind: "network" };
   }
@@ -996,17 +1041,7 @@ export const AgentRouterAuthPlugin = async (input) => {
               };
             },
           } : {}),
-          prompts: [
-            {
-              type: "select",
-              key: "site",
-              message: "选择站点（国际站 / 国内站）",
-              options: [
-                { value: "org", label: "国际站 agentrouter.org" },
-                { value: "air", label: "国内站 ps.air-outer.com" },
-              ],
-            },
-          ],
+          prompts: [SITE_PROMPT],
         },
         {
           type: "oauth",
@@ -1054,88 +1089,62 @@ export const AgentRouterAuthPlugin = async (input) => {
               },
             };
           },
-          prompts: [
-            {
-              type: "select",
-              key: "site",
-              message: "选择站点（国际站 / 国内站）",
-              options: [
-                { value: "org", label: "国际站 agentrouter.org" },
-                { value: "air", label: "国内站 ps.air-outer.com" },
-              ],
-            },
-            {
-              type: "password",
-              key: "accessToken",
-              message: "系统访问令牌（AgentRouter 个人设置 → 访问令牌；不是模型 API Key）",
-              validate: value => String(value ?? "").trim() ? undefined : "请输入系统访问令牌；如已有模型 Key，请改用 API Key 入口",
-            },
-          ],
+          prompts: [SITE_PROMPT, ACCESS_TOKEN_PROMPT],
         },
         {
           type: "oauth",
-          label: "LinuxDo（需系统访问令牌）",
+          label: "系统访问令牌（读取已有 Key）",
           authorize: async (inputs) => {
             const token = String(inputs?.accessToken ?? "").trim();
             if (!token) return { type: "failed", error: "请输入系统访问令牌；如已有模型 Key，请改用 API Key 接入。" };
+            const userId = String(inputs?.userId ?? "").trim();
+            if (!/^[1-9][0-9]*$/.test(userId)) return { type: "failed", error: "用户 ID 需为站点控制台里的纯数字 ID；可在站点「令牌」页请求头 New-Api-User 中查看。" };
+            const keyId = String(inputs?.modelKeyId ?? "").trim();
+            const keyIdError = modelKeyIdProblem(keyId);
+            if (keyIdError) return { type: "failed", error: keyIdError };
             const selected = siteOf(inputs?.site);
-            let state, cfg;
-            let stateCookie = "";
-            try {
-              const st = await oauthState(selected.site);
-              if (!st.ok || typeof st.state !== "string" || !st.state.trim()) throw new Error("invalid OAuth state");
-              state = st.state;
-              stateCookie = st.stateCookie ?? "";
-              cfg = await siteAuthConfig(selected.site);
-              if (!cfg.ok || !cfg.linuxdoId) throw new Error("invalid OAuth configuration");
-            } catch {
-              return { type: "failed", error: "无法获取 LinuxDo 授权配置，请检查网络或站点验证后重试，也可改用 API Key 接入。" };
-            }
-            const u = new URL(LINUXDO_AUTHORIZE_URL);
-            const redirectUri = `${cfg.origin}${LINUXDO_CALLBACK_PATH}`;
-            u.searchParams.set("client_id", cfg.linuxdoId);
-            u.searchParams.set("redirect_uri", redirectUri);
-            u.searchParams.set("response_type", "code");
-            u.searchParams.set("scope", "user");
-            u.searchParams.set("state", state);
+            const site = selected.site === SITES.air.site ? "air" : "org";
             return {
-              url: u.href,
-              method: "code",
-              instructions: "若未自动打开浏览器，请手动打开链接并完成 LinuxDo 授权。完成后会回到登录成功页，请复制地址栏的完整回调地址并粘贴回来，保留 code 和 state。授权码一次有效，失效后请重新登录。插件只查找已有模型 Key；失败时可改用 API Key 接入。请勿将回调地址发到聊天或日志。",
-              callback: async (value) => {
-                let cb;
+              url: `${selected.site}/console/token`,
+              method: "auto",
+              instructions: "若未自动打开浏览器，请手动打开站点「令牌」页。在 ID 列可查看每把模型 Key 的数字 ID：只有一把启用 Key 时不必填写；有多把时填写要使用的那把的 ID。系统访问令牌在个人设置 → 访问令牌 中生成，与模型 Key 不是同一件东西。插件只读取已有模型 Key，不创建、轮换或修改；保存后请运行模型测试确认可用。",
+              callback: async () => {
+                let found;
                 try {
-                  if (typeof value !== "string" || !value.trim().startsWith("https://")) throw new Error("full callback required");
-                  cb = githubCallbackCode(value, redirectUri, state);
-                  if (!cb) throw new Error("invalid callback");
+                  found = await storedKeyOf(selected.site, token, userId, keyId);
                 } catch {
-                  return { type: "failed", error: "回调地址无效或 state 不匹配。请重新登录获得新链接，再粘贴完整回调地址。" };
+                  return { type: "failed", error: "读取模型 Key 时请求失败或超时，请重试或改用 API Key 接入。" };
                 }
-                try {
-                  return await redeemGithub(selected.site, cb, state, { accessToken: token, provider: "linuxdo", stateCookie });
-                } catch {
-                  return { type: "failed", error: "LinuxDo 授权兑换请求失败或超时，请重新授权重试或改用 API Key 接入。" };
+                if (found.kind !== "found") {
+                  const extra = found.kind === "ambiguous" || found.kind === "incomplete"
+                    ? "。可在「模型 Key ID」中填写目标 Key 的 ID，或改用 API Key 接入"
+                    : "。请检查系统访问令牌、用户 ID 与站点后重试，或改用 API Key 接入";
+                  return { type: "failed", error: keyProblem(found.kind) + extra + "。" };
                 }
+                return {
+                  type: "success",
+                  key: found.key,
+                  metadata: {
+                    site,
+                    ...(site === "air" ? { apiBase: `${SITES.air.api}/v1` } : {}),
+                    accessToken: token,
+                    userId,
+                  },
+                };
               },
             };
           },
-          prompts: [
-            {
-              type: "select",
-              key: "site",
-              message: "选择站点（国际站 / 国内站）",
-              options: [
-                { value: "org", label: "国际站 agentrouter.org" },
-                { value: "air", label: "国内站 ps.air-outer.com" },
-              ],
-            },
-            {
-              type: "password",
-              key: "accessToken",
-              message: "系统访问令牌（AgentRouter 个人设置 → 访问令牌；不是模型 API Key）",
-              validate: value => String(value ?? "").trim() ? undefined : "请输入系统访问令牌；如已有模型 Key，请改用 API Key 入口",
-            },
-          ],
+          prompts: [SITE_PROMPT, ACCESS_TOKEN_PROMPT, {
+            type: "text",
+            key: "userId",
+            message: "用户 ID（站点「令牌」页请求头 New-Api-User 的纯数字值）",
+            validate: value => /^[1-9][0-9]*$/.test(String(value ?? "").trim()) ? undefined : "用户 ID 需为纯数字",
+          }, {
+            type: "text",
+            key: "modelKeyId",
+            message: "模型 Key ID（可选：站点「令牌」页 ID 列的纯数字值）",
+            validate: modelKeyIdProblem,
+          }],
         },
       ],
 
@@ -1221,7 +1230,6 @@ export const _internal = {
   DECLARED_MODELS,
   parseHeaders,
   parseCookies,
-  codeOf,
   headersOf,
   applyHeaders,
   apiBase,

@@ -1,6 +1,6 @@
 # AgentRouter 插件（magpie）
 
-给 magpie 接入 AgentRouter [国际站](https://agentrouter.org/)或[国内站](https://ps.air-outer.com/)：支持 API Key、GitHub 与 LinuxDo 登录，提供模型调用、余额与用量查询、每日签到，以及**可自定义请求头**。
+给 magpie 接入 AgentRouter [国际站](https://agentrouter.org/)或[国内站](https://ps.air-outer.com/)：支持 API Key、GitHub 与系统访问令牌登录，提供模型调用、余额与用量查询、每日签到，以及**可自定义请求头**。
 
 ## 文档导航
 
@@ -8,10 +8,20 @@
 - [安全政策](<SECURITY.md>)：敏感信息处理与私密漏洞报告。
 
 - [优化设计与升级指南](<docs/OPTIMIZATION.md>)：问题背景、与参考项目的取舍、兼容边界、升级/回滚与本地验证。
-- [更新日志](<CHANGELOG.md>)：0.1.7 站点选择、LinuxDo 登录与历史版本的变化。
+- [更新日志](<CHANGELOG.md>)：0.1.8 系统访问令牌接入、LinuxDo 入口移除与历史版本的变化。
 - [本地签到说明](<LOCAL-CHECKIN.md>)：独立签到工具的使用与安全边界。
 
 > 仓库源码更新不等于 npm 发布或你的网关已升级。请按升级指南自行验证；不要把真实 Cookie、访问令牌、私有词表或抓包提交到仓库。
+
+### 0.1.8：系统访问令牌接入，移除未通过真实验证的 LinuxDo 登录
+
+- 登录顺序为 **API Key、GitHub、系统访问令牌**；三种方式都可选择国际站 `agentrouter.org` 或国内站 `ps.air-outer.com`，默认国际站。
+- 新增 **系统访问令牌（读取已有 Key）**：询问站点、系统访问令牌、用户 ID 与可选的模型 Key ID，随后只读取该账号已有模型 Key。不请求任何 OAuth 授权接口，不创建、轮换或修改任何 Key。
+- 多把启用 Key 时必须填写站点「令牌」页 ID 列的目标 Key ID，插件按 `GET /api/token/{id}` 只读读取该把；只有一把启用且完整的 Key 时直接使用。不替用户代选、不补页、不重试。
+- **移除 LinuxDo OAuth 登录入口。** 真实验证结论：`connect.linux.do` 授权后回落到站点注册路由 `https://agentrouter.org/oauth/linuxdo`（并非请求里的 `/oauth/linuxdo/magpie` 子路径），站点前端在该路由挂载时立即请求 `/api/oauth/linuxdo`（真实验证记录到 1 次、HTTP 403）并跳转控制台，地址栏不再保留 `code`/`state`，插件侧手动回填在任何兑换请求之前即被拒绝。公开资料没有关于 LinuxDo redirect_uri 匹配语义的说明，站点前端确认该路由为精确匹配且没有任何可抑制自动兑换的标志位。
+- 移除范围包含 LinuxDo 方法、其常量、`/api/status` 的 `linuxdo_client_id` 读取与死代码 `codeOf`；GitHub 登录链路、提问形状与密钥筛选规则不变。
+
+> **本页登录流程适用于 0.1.8。** 下方命令固定该版本，安装前先查询 npm 官方 registry；源码版本号不等于已发布或你的网关已升级。0.1.7 曾发布 LinuxDo 登录入口，0.1.8 已将其移除，这不改变 0.1.7 已安装账号保存的数据。
 
 ### 0.1.7：站点选择与 LinuxDo 登录
 
@@ -22,7 +32,7 @@
 - 仅在已有密钥列表中存在唯一可用候选时保存；缺失、歧义或分页不完整时转为手动 API Key 恢复。不自动创建、轮换密钥或重试，不以空 key 完成 OAuth。
 - 同时包含完整 assistant 历史保留 `output_text` 的修复，以及 Windows Administrator 权限识别修复。loader 仍在缺失模型 key 时于网络请求前拒绝。
 
-> **本页登录流程适用于 0.1.7。** 下方命令固定该版本，安装前先查询 npm 官方 registry；源码版本号不等于已发布或你的网关已升级。LinuxDo 完整真实 OAuth 尚未实测；本次没有新增通过 LinuxDo Cookie 自动登录或签到续期的机制。
+> **本节为 0.1.7 发布时的历史记录，当前登录流程见 0.1.8。** 0.1.7 发布时尚未完成真实 LinuxDo OAuth 验证，后续复测发现该流程无法完成，0.1.8 已移除该入口。
 
 ### 0.1.5 变更
 
@@ -35,7 +45,7 @@
 
 ### 0.1.4 变更
 
-- 历史版本改进了系统令牌遮蔽输入和可选签到配置；当前操作请以下文 0.1.7 登录流程为准。
+- 历史版本改进了系统令牌遮蔽输入和可选签到配置；当前操作请以下文 0.1.8 登录流程为准。
 - 修复完整历史消息含空 `logprobs: []` 时漏掉内联重放的情况，保留工具关联、非空概率数据、引用注释和不透明状态。
 - 无法恢复仅存在于其他上游资源的历史或加密状态；这是范围受限的兼容补充，并非所有跨资源错误的通用解法。
 
@@ -51,19 +61,19 @@
 
 ```bash
 # 在有 Node.js / npm 的终端查询目标版本；确认可用后再安装
-npm view opencode-agentrouter-auth@0.1.7 version --registry=https://registry.npmjs.org
+npm view opencode-agentrouter-auth@0.1.8 version --registry=https://registry.npmjs.org
 
 # Docker：查询成功后安装，容器名按你的实际部署修改
-docker exec magpie magpie plugin add npm:opencode-agentrouter-auth@0.1.7
+docker exec magpie magpie plugin add npm:opencode-agentrouter-auth@0.1.8
 
 # 或者，本地 / 原生进程部署
-magpie plugin add npm:opencode-agentrouter-auth@0.1.7
+magpie plugin add npm:opencode-agentrouter-auth@0.1.8
 ```
 
 - Docker 与原生进程命令二选一。安装后用 `magpie plugin list --json`（Docker 中在命令前加 `docker exec magpie`）核对插件，再在面板检查 AgentRouter 的插件选项和登录状态。
 - 如果版本查询返回 `E404`，该版本在所查 registry 尚不可用；不要把源码版本号当成 npm 已发布证明，可改用下方源码安装。若仅宿主安装失败，可运行 `magpie plugin registry` 检查它实际使用的 registry；查询命令不会替你修改宿主设置。
 - 已用本地目录安装的用户，继续更新原目录即可；不要直接再添加一份 npm 插件。先备份并确认宿主如何关联插件路径、认证及选项，再决定是否迁移，避免重复注册或丢失原配置。
-- 固定 `@0.1.7` 便于复现；省略版本会让宿主选择版本，但并不等同于更新所有插件。`magpie plugin update` 则可能更新其他插件，不作为本插件的定点升级步骤。
+- 固定 `@0.1.8` 便于复现；省略版本会让宿主选择版本，但并不等同于更新所有插件。`magpie plugin update` 则可能更新其他插件，不作为本插件的定点升级步骤。
 - 已通过 npm 安装的用户，升级或降级前须确认当前宿主的**单包替换方式以及认证/选项保留行为**；未确认前暂停操作，不直接重复执行 `plugin add`。旧版本也须经 npm 查询确认存在，不能假设仓库旧版本都已发布。下方[升级/回滚指南](<docs/OPTIMIZATION.md#11-升级与回退>)针对本地包/目录备份，不是已验证的 npm 定点降级流程。
 
 #### Docker 源码安装
@@ -91,9 +101,9 @@ magpie plugin add /path/to/agentrouter-magpie-plugin
 
 ---
 
-### 2. 登录并绑定账号（0.1.7）
+### 2. 登录并绑定账号（0.1.8）
 
-以下流程适用于已加载 0.1.7 的宿主；0.1.6 及更早版本的菜单不同。新账号运行交互式登录命令（升级既有账号不要求重新登录）：
+以下流程适用于已加载 0.1.8 的宿主；0.1.7 及更早版本的菜单不同（0.1.7 的 LinuxDo 入口已在 0.1.8 移除）。新账号运行交互式登录命令（升级既有账号不要求重新登录）：
 ```bash
 docker exec -it magpie magpie plugin login agentrouter
 # 非 Docker 环境直接运行：magpie plugin login agentrouter
@@ -118,13 +128,19 @@ docker exec -it magpie magpie plugin login agentrouter
 
 **恢复方式：** 按提示改选 API Key，将你明确选定的模型 key 填入宿主原生输入框。插件不自动创建或轮换密钥、不自动重试，也不会以空 key 宣告 OAuth 成功。即使凭据已保存，仍需模型测试；管理令牌或余额读取成功同样不证明模型可用。
 
-#### 方案 C：LinuxDo 授权（需要管理令牌及手动回调）
+#### 方案 C：系统访问令牌（读取已有 Key）
 
-适合已绑定 LinuxDo 的 AgentRouter 账号。选择 LinuxDo 登录方式和站点，填写该 AgentRouter 账号的**系统访问令牌**，再打开提供的 LinuxDo 授权链接。授权后把保留 `code` 和 `state` 的完整回调 URL 粘回宿主；插件校验来源与 state，再兑换登录态并查找已有模型 key，密钥筛选和恢复规则与 GitHub 相同。
+适合已经登录过站点、知道自己的用户 ID 与模型 Key ID 的 AgentRouter 账号。流程为：**选择站点 → 系统访问令牌 → 用户 ID →（多把 Key 时）模型 Key ID → 读取已有模型 key**。
 
-当前生成的回调路径为 `/oauth/linuxdo/magpie`，用于避开站点原回调页的自动兑换。**此流程已通过合成回归，尚未完成真实账号 OAuth 实测**；若授权服务拒绝回调或登录无法完成，可改用 API Key 接入。不要公开回调 URL、Cookie 或系统访问令牌。
+1. 在 AgentRouter「个人设置」→「访问令牌」复制**系统访问令牌**。它是管理凭据，**不是模型 API Key**；此方式只用它读取你自己账号下的已有多模型 Key。
+2. 选择「系统访问令牌（读取已有 Key）」和站点，粘贴系统访问令牌。
+3. 填写**用户 ID**：该站点的用户接口必须同时带用户 ID，缺少时同接口返回 401。用户 ID 是站点「令牌」页请求头 `New-Api-User` 的纯数字值。
+4. **模型 Key ID 可留空**：账号只有一把启用且完整的 Key 时直接使用。有多把时，在站点「令牌」页的 **ID 列**复制目标 Key 的数字 ID 并填写；插件随后按 `GET /api/token/{id}` 只读读取该把 Key。
+5. 插件只读取，不创建、轮换或修改任何 Key；不请求任何 OAuth 授权接口。密钥筛选和恢复规则与 GitHub 相同：候选须启用（`status=1`）、非空、未掩码、未过期。
 
-本次没有新增 LinuxDo Cookie 自动登录或签到续期；已有站点会话的账号查询与签到仍沿用原机制。
+**恢复方式：** 与 GitHub 相同，按提示改选 API Key 并手动指定模型 key。没有唯一答案时不代选、不补页、不重试，也不以空 key 成功。
+
+**为什么没有 LinuxDo 方案。** 0.1.7 曾提供 LinuxDo 授权登录；真实验证证明它无法完成：授权最终回落到站点注册路由 `/oauth/linuxdo`（不是插件请求的子路径），站点页面在该路由自行请求 `/api/oauth/linuxdo` 兑换并立即跳走，地址栏不再保留 `code`/`state`，插件拿不到可用于兑换的回调。这不是放宽路径校验能解决的问题——放宽只会让用户拿到一枚已被站点页面用掉的授权码。该入口已在 0.1.8 整体移除。若你需要用 LinuxDo 账号本身登录站点，请在浏览器里正常登录站点，再回到本插件的「系统访问令牌」方式。
 
 ---
 
@@ -168,15 +184,15 @@ docker exec magpie magpie quota agentrouter
 |---|---|---|
 | **API Key** | 站点选择、宿主原生单个模型 key 输入框 | 保存不验证；可测试对话、模型列表，不能据此推算余额 |
 | **GitHub** | 站点选择、系统访问令牌（遮蔽输入），浏览器授权后完整手动回调 | 查找唯一已有模型 key；管理令牌和宿主登录状态不等于模型验证 |
-| **LinuxDo** | 站点选择、系统访问令牌（遮蔽输入），浏览器授权后完整手动回调 | 密钥规则与 GitHub 相同；完整真实 OAuth 尚未实测 |
+| **系统访问令牌** | 站点选择、系统访问令牌（遮蔽输入）、用户 ID、可选的模型 Key ID | 只读取该账号已有模型 key；不请求 OAuth，不创建或轮换 Key |
 
-新账号默认使用 `agentrouter.org`，可选择国内站；升级不改写旧账号保存的 key、站点、请求头或其他设置。首次登录询问站点，但不询问端点、请求头、用户 ID、用户名密码或 Cookie。
+新账号默认使用 `agentrouter.org`，可选择国内站；升级不改写旧账号保存的 key、站点、请求头或其他设置。GitHub 方式只询问站点与系统访问令牌；系统访问令牌方式额外询问用户 ID 与可选的模型 Key ID（都能在站点「令牌」页看到），因为该站点的用户接口必须同时带这两项。
 
 余额与签到的既有能力继续保留。需要高级配置时，先备份，再按下文 [手动配置格式](<#手动配置文件格式plugin-authjson>) 维护既有账号 metadata；这些不是额外登录方式或必填问题：
 
 - `cookie` 或 `accessToken` + `userId`：尝试读取账号余额；访问令牌失效时仍可尝试已有有效 Cookie，均不保证通过 WAF。
 - `githubCookie` + 本站 `userId`：可选签到续期，GitHub 会话过期或需要授权确认时仍须人工处理。
-- `username` / `password`：仅兼容仍支持密码登录的旧站点；仅使用 GitHub / LinuxDo 授权的用户无需填写。
+- `username` / `password`：仅兼容仍支持密码登录的旧站点；仅使用 GitHub / 系统访问令牌授权的用户无需填写。
 - `endpoint` / `apiBase` / `site` / `headers`：保留既有端点、站点与请求头能力。
 
 **当前插件选项仅支持布尔开关，没有新增 Cookie 设置页或任意文本选项。** 不要把凭据粘贴到布尔选项；高级字段只能通过已有宿主能力或下文的手动配置路径维护。
@@ -451,14 +467,14 @@ JSON 仅在 HTTP **200 / 400 / 429** 时检查副本，最多 **64 KiB / 2 秒**
 
 SSE 仍只观察首个有效内容或未知事件之前最多 **64 KiB / 15 秒** 的前缀。增量解析兼容混合换行、注释、多行 `data:` 与跨块 UTF-8；重复 `event:` 取最后一个值，只移除冒号后的一个可选空格。已知字段内出现未知数据形状时也立即结束诊断，透传原始字节并保留取消、背压及超时中的在途读取；不发送心跳、不缓存整段回答、不观察已经放行的后续事件。相关实现见 [response.mjs](<response.mjs>)。
 
-## API Key 保存与故障恢复（0.1.7）
+## API Key 保存与故障恢复（0.1.8）
 
 API Key 方式保留宿主原生的一个 key 输入框，插件仅询问站点。当前宿主不会把原生 key 传给 API `authorize`，因此不做保存前联网验证，不读取不存在的 `inputs.key`，也不增加第二个 key 字段或 verified 状态。
 
 - **保存不等于验证**：保存后运行 `magpie provider test agentrouter`，再判断模型是否可用。宿主已登录、管理令牌有效和余额可读都不是模型验证结果。
 - **本地 `400 agentrouter_missing_api_key`**：loader 遇到缺失 key 或保留占位 key，在任何网络请求前返回。改选 API Key，保存真实模型 key 后再测。
 - **旧配置端点误填 key**：`endpoint` 应为 HTTP(S) 地址。既有端点校验回退能力保留；如需手动修正，先备份，不要把 key 或其他凭据写入 URL。
-- **GitHub / LinuxDo 查 key 不确定**：没有唯一可用候选或列表分页不完整时，手动指定模型 key；不自动创建、轮换、重试或保存空 key。
+- **GitHub / 系统访问令牌查 key 不确定**：没有唯一可用候选或列表分页不完整时，手动指定模型 key；不自动创建、轮换、重试或保存空 key。系统访问令牌方式有多把 Key 时，先按站点「令牌」页的 ID 列填写目标 Key ID。
 
 ## GitHub 登录怎么走
 
@@ -485,7 +501,7 @@ API Key 方式保留宿主原生的一个 key 输入框，插件仅询问站点�
 >
 > 因此跳过去看到「页面未找到」是**正常现象**，照常复制地址栏即可；真正让 code 失效的是站点那个会自兑换的回调页。
 
-LinuxDo 复用上述 state、手动回调、会话保存和已有 key 筛选步骤，但读取 `linuxdo_client_id`，授权地址为 `https://connect.linux.do/oauth2/authorize`，兑换接口为 `/api/oauth/linuxdo`。两种方式分别检查自己的 client ID，并保存 `metadata.provider`；国内站新授权还保存 `metadata.apiBase`。GitHub 的子路径匹配规则不能作为 LinuxDo 的规则证明，LinuxDo 的真实回调兼容性仍属本次未实测范围。
+系统访问令牌方式不使用回调与授权码：只带 `Authorization` 系统访问令牌与 `New-Api-User` 用户 ID 读取 `GET /api/token/`。未填 Key ID 时沿用上面的列表与唯一性规则；填写了 Key ID 时按 `GET /api/token/{id}` 只读读取该把 Key（站点确认该路由存在并以 `New-Api-User` 鉴权）。该方式不请求 `/api/oauth/*`，保存 `metadata.site` 与 `apiBase`（国内站）。GitHub 的子路径匹配规则不适用于其他提供商；0.1.7 的 LinuxDo 路径因真实验证失败已在 0.1.8 移除，详见上文「为什么没有 LinuxDo 方案」。
 
 ## 改请求头（不用重新登录）
 
@@ -533,7 +549,7 @@ LinuxDo 复用上述 state、手动回调、会话保存和已有 key 筛选步�
 
 - `endpoint`：显式配置时优先决定对话和模型列表地址；没有显式端点时读取已保存的 `apiBase`，两者都没有才默认 `https://agentrouter.org/v1`
 - `site`（`org` / `air`）：余额和签到所用站点；新账号默认 `org`，升级保留旧值
-- 0.1.7 的新国内站登录会显式保存 `apiBase: https://ps.air-outer.com/v1`，使新账号的模型调用与所选站点一致
+- 0.1.7 起的新国内站登录会显式保存 `apiBase: https://ps.air-outer.com/v1`，使新账号的模型调用与所选站点一致
 
 旧账号若只有 `site: air` 而没有 endpoint / apiBase，升级后模型仍走国际站，不自动迁移。你仍可显式配置模型请求走国际站、余额和签到走国内站；仅改 site 不会覆盖已保存的模型端点。
 
@@ -583,7 +599,7 @@ npm run test:headers     # 需要 Python 3；仅执行维护脚本的 Python 部
 
 ## 文件
 
-- `index.mjs` — 插件本体（provider + 自定义头 + 余额 + 签到 + GitHub / LinuxDo 登录）
+| `index.mjs` — 插件本体（provider + 自定义头 + 余额 + 签到 + GitHub / 系统访问令牌登录）
 - `response.mjs` — HTTP / SSE 早期失败识别与有界流透传（安装时必须一起复制）
 - `package.json` — 包描述
 - `set-ar-headers.sh` — 改请求头的小工具

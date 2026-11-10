@@ -6,10 +6,13 @@ test("onboarding keeps native API Key input and asks for site plus system token"
   const p = await plugin({ magpie: {} });
   assert.deepEqual(p.auth.methods.map(m => m.type), ["api", "oauth", "oauth"]);
   assert.deepEqual(p.auth.methods[0].prompts.map(p => p.key), ["site"]);
+  assert.deepEqual(p.auth.methods[1].prompts.map(p => p.key), ["site", "accessToken"]);
+  assert.deepEqual(p.auth.methods[2].prompts.map(p => p.key), ["site", "accessToken", "userId", "modelKeyId"]);
   for (const oauth of p.auth.methods.filter(m => m.type === "oauth")) {
-    assert.deepEqual(oauth.prompts.map(p => p.key), ["site", "accessToken"]);
     assert.equal(oauth.prompts[1].type, "password");
   }
+  assert.equal(p.auth.methods[1].label, "GitHub（需系统访问令牌）");
+  assert.equal(p.auth.methods[2].label, "系统访问令牌（读取已有 Key）");
 });
 
 test("missing model Key fails locally without forwarding SDK placeholder or management credentials", async t => {
