@@ -991,7 +991,7 @@ async function modelsOf(provider, { auth } = {}) {
   }
 }
 
-export const AgentRouterAuthPlugin = async (input) => {
+export const AgentRouterAuthPlugin = async (input, options = {}) => {
   // The host hands over its reader for the provider's switches; an older one
   // has none, and the Codex headers stay on there (README, "为什么需要自定义
   // 请求头"). Reading it through a closure keeps headersOf's own signature —
@@ -1176,7 +1176,9 @@ export const AgentRouterAuthPlugin = async (input) => {
               portableResponses: portableResponses(),
               textFilter: textFilterEnabled() ? textFilter : null,
             });
-            return explainResponse(await fetch(input, prepared));
+            return explainResponse(await fetch(input, prepared), {
+              retryAfterSeconds: meta(auth, "retryAfterSeconds") ?? options?.retryAfterSeconds,
+            });
           },
         };
       },

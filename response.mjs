@@ -6,6 +6,7 @@ import { readCloneText } from "./body-inspection.mjs";
 // through. Never retry here: magpie owns routing, the caller owns cancellation.
 const PRELUDE_BYTES = 64 * 1024;
 const PRELUDE_MS = 15_000;
+const DEFAULT_RETRY_AFTER_SECONDS = 10;
 const TOKEN_RATE_LIMIT = /exceeded\s+token\s+rate\s+limit/i;
 const TRANSIENT_STATUSES = [429, 500, 502, 503, 504];
 const TRANSIENT_CODES = ["rate_limit_exceeded", "server_error", "overloaded_error", "high_demand"];
@@ -63,6 +64,20 @@ function changedHeaders(original) {
   return h;
 }
 
+function retrySeconds(value) {
+  const seconds = typeof value === "string" && /^[0-9]+$/.test(value.trim()) ? Number(value.trim()) : value;
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : DEFAULT_RETRY_AFTER_SECONDS;
+}
+
+function rateLimitHeaders(original, retryAfterSeconds) {
+  const headers = changedHeaders(original);
+  // Explicit upstream waits take precedence, including millisecond hints.
+  if (!["retry-after", "retry-after-ms", "x-ms-retry-after-ms"].some(name => headers.has(name))) {
+    headers.set("retry-after", String(retryAfterSeconds));
+  }
+  return headers;
+}
+
 function isBusinessError(e, depth = 0) {
   if (depth > 4 || e == null) return false;
   if (typeof e === "string") {
@@ -81,7 +96,7 @@ function isBusinessError(e, depth = 0) {
   return /invalid.{0,12}api.?key|unauthenticated|unauthorized|authentication|permission denied|forbidden|quota|balance|billing|payment required|content policy|content filter/i.test(message);
 }
 
-function transientFailureResponse(e, originalHeaders) {
+function transientFailureResponse(e, originalHeaders, retryAfterSeconds) {
   const numericStatus = [e.status, e.status_code, e.code].map(numericCode).find(value =>
     TRANSIENT_STATUSES.includes(value));
   const code = [e.code, e.type].find(value =>
@@ -95,14 +110,14 @@ function transientFailureResponse(e, originalHeaders) {
     code: e.code ?? status,
     type: rateLimited ? "agent_router_upstream_rate_limit" : busy ? "agent_router_upstream_busy" : "agent_router_upstream_error",
     message: rateLimited
-      ? "AgentRouter 上游报告了速率限制。请按上游 Retry-After 等待，或稍后再试；插件未自动重试。"
+      ? "AgentRouter 上游报告了速率限制。请按 Retry-After 或上游等待提示重试；插件未自动重试。"
       : busy ? "AgentRouter 上游当前繁忙。请稍后再试；插件未自动重试。"
         : "AgentRouter 上游报告了暂时性服务错误。请稍后再试；插件未自动重试。",
     upstream: typeof e.message === "string" ? e.message : "",
-  } }), { status, headers: changedHeaders(originalHeaders) });
+  } }), { status, headers: status === 429 ? rateLimitHeaders(originalHeaders, retryAfterSeconds) : changedHeaders(originalHeaders) });
 }
 
-function failureResponse(value, originalHeaders) {
+function failureResponse(value, originalHeaders, retryAfterSeconds) {
   const e = hasNestedError(value)
     ? inheritErrorStatus(value, errorDetail(value.error ?? value.response?.error, 1))
     : errorDetail(value);
@@ -112,14 +127,15 @@ function failureResponse(value, originalHeaders) {
   const foreignItem = /requested item was created under a different[^.]{0,100}OpenAI resource/i.test(message);
   if (!blocked && !foreignItem && (isBusinessError(value) || isBusinessError(e))) return null;
   const capped = !blocked && !foreignItem && TOKEN_RATE_LIMIT.test(message);
-  if (!capped && !blocked && !foreignItem) return transientFailureResponse(e, originalHeaders);
-  const headers = changedHeaders(originalHeaders);
-  if (capped && !headers.has("retry-after")) headers.set("retry-after", "60");
+  if (!capped && !blocked && !foreignItem) return transientFailureResponse(e, originalHeaders, retryAfterSeconds);
+  const headers = capped ? rateLimitHeaders(originalHeaders, retryAfterSeconds) : changedHeaders(originalHeaders);
+  const wait = headers.get("retry-after");
+  const waitHint = /^[0-9]+$/.test(wait ?? "") ? `${wait} 秒后再试` : "按上游等待提示重试";
   const model = /requests to (\S+) for \S+/i.exec(message)?.[1];
   const id = /request id:\s*([A-Za-z0-9]+)/i.exec(message)?.[1];
   const trace = /trace_id[=:]([A-Za-z0-9_-]{1,128})/.exec(message)?.[1];
   const note = capped
-    ? `AgentRouter${model ? ` 的 ${model}` : ""} 达到了上游 token 速率上限。请按 Retry-After 等待后重试；上游未提供等待时间时，插件建议一分钟后再试，不保证届时已恢复。不要立即重发同一请求。`
+    ? `AgentRouter${model ? ` 的 ${model}` : ""} 达到了上游 token 速率上限。请${waitHint}，不保证届时已恢复。不要立即重发同一请求。`
     : foreignItem
       ? `AgentRouter 的 Responses 历史条目属于另一个 OpenAI 资源${trace ? ` [trace_id=${trace}]` : ""}。请由客户端重发完整内联历史（store:false），或固定到创建该条目的同一上游资源；仅有 previous_response_id / item_reference 或不兼容的加密状态时，插件不能无损恢复。未自动重试。`
       : `AgentRouter 的内容过滤器拒绝了这段请求内容${id ? ` (request id: ${id})` : ""}。请改写被拒的部分，或改用其他服务商。`;
@@ -181,7 +197,7 @@ function hasChatOutput(choice) {
 // null means harmless prelude; true means release unchanged; Response is an
 // explicit early failure. Looking only in error envelopes avoids matching text
 // in a perfectly good answer that quotes an error message.
-function inspectEvent(frame, headers) {
+function inspectEvent(frame, headers, retryAfterSeconds) {
   const lines = frame.split(/\r\n|\n|\r/);
   let name;
   const dataLines = [];
@@ -209,7 +225,7 @@ function inspectEvent(frame, headers) {
   if (Array.isArray(j.response?.output) && j.response.output.some(hasOutput)) return true;
   if (Array.isArray(j.choices) && j.choices.some(hasChatOutput)) return true;
   const error = j.error ?? j.response?.error ?? ((type === "error" || type === "response.failed" || name === "error" || name === "response.failed") ? j : null);
-  if (error) return failureResponse(j, headers) ?? true;
+  if (error) return failureResponse(j, headers, retryAfterSeconds) ?? true;
   if (type === "response.completed") {
     const r = j.response;
     if (r?.status === "completed" && Array.isArray(r.output) && r.output.length === 0 &&
@@ -223,7 +239,7 @@ function inspectEvent(frame, headers) {
 
 // CR ends a line immediately; a following LF (even in the next chunk) belongs
 // to that same ending. This also handles legal mixed newline event separators.
-function eventScanner(headers) {
+function eventScanner(headers, retryAfterSeconds) {
   let line = "", lines = [], afterCR = false;
   return text => {
     for (const char of text) {
@@ -232,7 +248,7 @@ function eventScanner(headers) {
       if (char !== "\r" && char !== "\n") { line += char; continue; }
       afterCR = char === "\r";
       if (line) { lines.push(line); line = ""; continue; }
-      const result = inspectEvent(lines.join("\n"), headers);
+      const result = inspectEvent(lines.join("\n"), headers, retryAfterSeconds);
       lines = [];
       if (result !== null) return result;
     }
@@ -240,12 +256,12 @@ function eventScanner(headers) {
   };
 }
 
-async function inspectStream(res) {
+async function inspectStream(res, retryAfterSeconds) {
   if (!res.body) return res;
   const reader = res.body.getReader();
   const chunks = [];
   const decoder = new TextDecoder();
-  const scan = eventScanner(res.headers);
+  const scan = eventScanner(res.headers, retryAfterSeconds);
   let bytes = 0, inflight, timer;
   const expired = new Promise(resolve => { timer = setTimeout(() => resolve(null), PRELUDE_MS); });
   const cancel = reason => { void reader.cancel(reason).catch(() => {}); };
@@ -290,10 +306,11 @@ async function inspectStream(res) {
   }
 }
 
-export async function explainResponse(res) {
+export async function explainResponse(res, { retryAfterSeconds } = {}) {
   if (!res) return res;
+  const waitSeconds = retrySeconds(retryAfterSeconds);
   const type = res.headers.get("content-type") ?? "";
-  if (res.status === 200 && /text\/event-stream/i.test(type)) return inspectStream(res);
+  if (res.status === 200 && /text\/event-stream/i.test(type)) return inspectStream(res, waitSeconds);
   if (![200, 400, 429].includes(res.status)) return res;
   // JSON success responses can also carry an error envelope. Ordinary successful
   // replies, unknown failures and non-JSON content remain untouched.
@@ -304,5 +321,5 @@ export async function explainResponse(res) {
   try { j = JSON.parse(text); } catch { return res; }
   const error = j?.error ?? j?.response?.error ??
     ((res.status >= 400 || j?.type === "error" || j?.type === "response.failed") ? j : null);
-  return error ? failureResponse(j, res.headers) ?? res : res;
+  return error ? failureResponse(j, res.headers, waitSeconds) ?? res : res;
 }
