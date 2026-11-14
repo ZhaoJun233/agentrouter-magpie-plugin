@@ -9,7 +9,7 @@ const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n
 const fail = frame('error', cap);
 const created = frame('response.created', { type: 'response.created', response: { output: [] } });
 const sse = (body, extra = {}) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream', ...extra } });
-async function load(response) {
+async function load(response, auth = {}, options) {
   const old = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = async () => {
@@ -17,8 +17,8 @@ async function load(response) {
     return response;
   };
   try {
-    const p = await AgentRouterAuthPlugin();
-    const l = await p.auth.loader(async () => ({ key: 'sk-example' }), {});
+    const p = await AgentRouterAuthPlugin(undefined, options);
+    const l = await p.auth.loader(async () => ({ key: 'sk-example', ...auth }), {});
     return await l.fetch('https://example.invalid/v1/responses', { method: 'POST', body: '{}' });
   } finally { globalThis.fetch = old; }
 }
@@ -31,7 +31,7 @@ test('Whitelisted numeric upstream statuses in explicit errors replace false HTT
       assert.equal(r.status, status, field + '=' + status);
       assert.equal((await r.json()).error.type, status === 429
         ? 'agent_router_upstream_rate_limit' : 'agent_router_upstream_error');
-      assert.equal(r.headers.get('retry-after'), null);
+      assert.equal(r.headers.get('retry-after'), status === 429 ? '10' : null);
     }
   }
 });
@@ -97,10 +97,119 @@ test('Unknown status, malformed numeric strings and detail-less failures stay by
 test('Wire HTTP200 event:error with api_error payload becomes explicit 429', async () => {
   const r = await load(sse(fail));
   assert.equal(r.status, 429);
-  assert.equal(r.headers.get('retry-after'), '60');
+  assert.equal(r.headers.get('retry-after'), '10');
   const j = await r.json();
   assert.equal(j.error.type, 'agent_router_token_rate_limit');
   assert.equal(j.error.upstream, message);
+});
+
+test('Configured rate-limit retry wait reaches token and generic JSON/SSE failures', async () => {
+  const responses = [
+    () => new Response(JSON.stringify(cap), { status: 429, headers: { 'content-type': 'application/json' } }),
+    () => new Response(JSON.stringify({ error: cap }), { headers: { 'content-type': 'application/json' } }),
+    () => sse(created + fail),
+    () => new Response(JSON.stringify({ error: { code: 'rate_limit_exceeded' } }), { status: 429, headers: { 'content-type': 'application/json' } }),
+    () => new Response(JSON.stringify({ error: { status: 429, message: 'rate limited' } }), { headers: { 'content-type': 'application/json' } }),
+    () => sse(frame('response.failed', { response: { error: { code: 'rate_limit_exceeded' } } })),
+  ];
+  for (const [auth, wait] of [
+    [{}, '10'],
+    [{ metadata: { retryAfterSeconds: 37 } }, '37'],
+    [{ metadata: { retryAfterSeconds: ' 12 ' } }, '12'],
+    [{ retryAfterSeconds: 23, metadata: { retryAfterSeconds: 45 } }, '23'],
+    [{ retryAfterSeconds: '', metadata: { retryAfterSeconds: 45 } }, '45'],
+  ]) {
+    for (const response of responses) {
+      const r = await load(response(), auth);
+      assert.equal(r.status, 429);
+      assert.equal(r.headers.get('retry-after'), wait);
+      const error = (await r.json()).error;
+      if (error.type === 'agent_router_token_rate_limit') assert.ok(error.message.includes(wait + ' 秒后再试'));
+    }
+  }
+});
+
+test('Native plugin options set the retry wait and account settings can override it', async () => {
+  for (const [options, auth, expected] of [
+    [{ retryAfterSeconds: 23 }, {}, '23'],
+    [{ retryAfterSeconds: ' 17 ' }, {}, '17'],
+    [{ retryAfterSeconds: 23 }, { metadata: { retryAfterSeconds: 7 } }, '7'],
+    [{ retryAfterSeconds: 23 }, { retryAfterSeconds: 9 }, '9'],
+    [{ retryAfterSeconds: 0 }, {}, '10'],
+    [null, {}, '10'],
+    [{}, {}, '10'],
+  ]) {
+    for (const response of [sse(fail), Response.json({ error: cap }, { status: 429 })]) {
+      const r = await load(response, auth, options);
+      assert.equal(r.headers.get('retry-after'), expected);
+      await r.text();
+    }
+  }
+});
+
+test('Invalid retry wait configuration falls back to ten seconds', async () => {
+  for (const value of [undefined, null, '', ' ', 0, -1, 1.5, true, false, [], {}, NaN, Infinity,
+    '0', '-2', '1.5', '1e2', '0x10', 'invalid', Number.MAX_SAFE_INTEGER + 1, '9007199254740992']) {
+    const r = await load(sse(fail), { metadata: { retryAfterSeconds: value } });
+    assert.equal(r.headers.get('retry-after'), '10', String(value));
+    assert.match((await r.json()).error.message, /10 秒后再试/);
+  }
+});
+
+test('Configured retry wait preserves upstream seconds, dates and millisecond hints', async () => {
+  for (const extra of [
+    { 'retry-after': '120' },
+    { 'retry-after': 'Wed, 04 Nov 2026 08:00:00 GMT' },
+    { 'retry-after-ms': '2500' },
+    { 'x-ms-retry-after-ms': '7000' },
+  ]) {
+    for (const error of [cap, { code: 'rate_limit_exceeded' }]) {
+      for (const response of [
+        sse(frame('error', error), extra),
+        new Response(JSON.stringify({ error }), { status: 429, headers: { 'content-type': 'application/json', ...extra } }),
+      ]) {
+        const r = await load(response, { metadata: { retryAfterSeconds: 5 } });
+        assert.equal(r.status, 429);
+        assert.equal(r.headers.get('retry-after'), extra['retry-after'] ?? null);
+        for (const [name, value] of Object.entries(extra)) assert.equal(r.headers.get(name), value);
+        assert.ok(!(await r.json()).error.message.includes('5 秒后再试'));
+      }
+    }
+  }
+});
+
+test('Retry wait configuration stays scoped to each account loader', async t => {
+  const old = globalThis.fetch;
+  t.after(() => { globalThis.fetch = old; });
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return sse(fail); };
+  const p = await AgentRouterAuthPlugin();
+  const loaders = await Promise.all([4, 19, undefined].map(retryAfterSeconds =>
+    p.auth.loader(async () => ({ key: 'sk-example', metadata: { retryAfterSeconds } }), {})));
+  for (const index of [1, 0, 2, 1]) {
+    const r = await loaders[index].fetch('https://example.invalid/v1/responses', { method: 'POST', body: '{}' });
+    assert.equal(r.headers.get('retry-after'), String([4, 19, 10][index]));
+    await r.json();
+  }
+  assert.equal(calls, 4, 'each call sends exactly one upstream request');
+});
+
+test('Configured retry wait leaves non-rate errors and unknown HTTP429 bodies unchanged', async () => {
+  for (const [status, error, expectedStatus] of [
+    [429, { code: 'insufficient_quota', message: 'out of quota' }, 429],
+    [429, { code: 'unknown_error', message: 'unknown failure' }, 429],
+    [400, { code: 'content-blocked', message: 'content-blocked' }, 400],
+    [200, { code: 'server_error', message: 'service failure' }, 500],
+    [200, { code: 'high_demand', message: 'busy' }, 503],
+  ]) {
+    const body = JSON.stringify({ error });
+    const r = await load(new Response(body, { status, headers: { 'content-type': 'application/json' } }),
+      { metadata: { retryAfterSeconds: 5 } });
+    assert.equal(r.status, expectedStatus);
+    assert.equal(r.headers.get('retry-after'), null);
+    if (status === 429) assert.equal(await r.text(), body);
+    else await r.text();
+  }
 });
 
 test('Nested JSON message in response.failed after metadata is recognized', async () => {

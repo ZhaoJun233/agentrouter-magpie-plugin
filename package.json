@@ -1,6 +1,6 @@
 {
   "name": "opencode-agentrouter-auth",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "AgentRouter provider for magpie and OpenCode: org/air site selection, API Key, GitHub and system-token sign-in, configurable headers, balance and daily check-in",
   "type": "module",
   "main": "./index.mjs",
@@ -40,6 +40,9 @@
     "url": "git+https://github.com/ZhaoJun233/agentrouter-magpie-plugin.git"
   },
   "magpie": {
-    "maxConcurrency": 2
+    "maxConcurrency": 2,
+    "options": {
+      "retryAfterSeconds": 10
+    }
   }
 }

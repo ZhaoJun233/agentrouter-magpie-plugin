@@ -153,8 +153,8 @@ test('A token-rate-limit 429 says it is a rate cap with a wait, not a spent acco
   // The vendor answers its per-minute token cap with 429 and no Retry-After,
   // and says nothing about when it lifts. magpie retries it on every account
   // (each retry spending more of the same counted tokens) and then fails over,
-  // so the caller can end up seeing another provider's 429. Saying "wait a
-  // minute" and sending Retry-After is what a caller can act on.
+  // so the caller can end up seeing another provider's 429. A configurable
+  // Retry-After gives the caller a concrete wait without retrying here.
   const original = globalThis.fetch;
   const capped = JSON.stringify({
     message: 'Your requests to gpt-6.1-sol for gpt-6.1-sol in example-region have exceeded token rate limit.',
@@ -170,10 +170,10 @@ test('A token-rate-limit 429 says it is a rate cap with a wait, not a spent acco
       body: '{}',
     });
     assert.equal(res.status, 429);
-    assert.equal(res.headers.get('retry-after'), '60');
+    assert.equal(res.headers.get('retry-after'), '10');
     const text = await res.text();
     assert.match(text, /gpt-6\.1-sol/);
-    assert.match(text, /一分钟后再试/);
+    assert.match(text, /10 秒后再试/);
     assert.match(text, /不保证届时已恢复/);
     // still a rate limit, so magpie keeps treating it as one (failRate)
     assert.match(text, /token rate limit/i);
