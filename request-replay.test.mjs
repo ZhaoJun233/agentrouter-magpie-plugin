@@ -11,7 +11,7 @@ const history = () => ({ model: "model", store: true, stream: true, input: [
   { type: "function_call_output", id: "fco_old", call_id: "call_old", output: JSON.stringify({ id: "result-id", value: 42 }) },
 ], tools: [{ type: "function", name: "lookup", parameters: { type: "object", properties: { id: { type: "string" } } } }] });
 async function loader(enabled = true) {
-  const p = await plugin({ magpie: { option: (_provider, name) => name === "portable-responses" ? enabled : true } });
+  const p = await plugin({ magpie: { option: (_provider, name) => name === "portable-responses" ? enabled : undefined } });
   return p.auth.loader(async () => ({ type: "api", key: "test-key", metadata: { site: "org" } }), {});
 }
 async function capture(t, input, init, enabled = true) {

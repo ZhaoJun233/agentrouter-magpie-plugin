@@ -1,12 +1,13 @@
 {
   "name": "opencode-agentrouter-auth",
   "version": "0.1.9",
-  "description": "AgentRouter provider for magpie and OpenCode: org/air site selection, API Key, GitHub and system-token sign-in, configurable headers, balance and daily check-in",
+  "description": "适用于 magpie 和 OpenCode 的 AgentRouter 插件：国际/国内站选择、API Key/GitHub/系统访问令牌登录、自定义请求头、余额与签到、文字替换、历史内联及可选的 Codex 会话资源清理",
   "type": "module",
   "main": "./index.mjs",
   "scripts": {
     "test:policy": "node --test .github/scripts/pr-policy.test.cjs",
-    "test": "node --test body-inspection.test.mjs usage.test.mjs loader-stream.test.mjs response-bounds.test.mjs checkin.test.mjs local-checkin.test.mjs local-checkin.integration.test.mjs windows-acl.test.mjs request-replay.test.mjs content-filter.test.mjs auth-guidance.test.mjs auth-flow.test.mjs resource-compat.test.mjs auth-request-boundary.test.mjs response-preservation.test.mjs",
+    "test": "node --test body-inspection.test.mjs usage.test.mjs loader-stream.test.mjs response-bounds.test.mjs checkin.test.mjs local-checkin.test.mjs local-checkin.integration.test.mjs windows-acl.test.mjs request-replay.test.mjs content-filter.test.mjs auth-guidance.test.mjs auth-flow.test.mjs resource-compat.test.mjs auth-request-boundary.test.mjs response-preservation.test.mjs session-repair.test.mjs",
+    "test:session-repair": "node --test session-repair.test.mjs",
     "test:headers": "python3 set-ar-headers.test.py"
   },
   "exports": "./index.mjs",
@@ -14,6 +15,7 @@
     "index.mjs",
     "response.mjs",
     "request.mjs",
+    "session-repair.mjs",
     "body-inspection.mjs",
     "github-cookie.mjs",
     "content-filter.mjs",
