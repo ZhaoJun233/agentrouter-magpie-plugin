@@ -2,6 +2,7 @@ import { explainResponse } from "./response.mjs";
 import { prepareRequest } from "./request.mjs";
 import { loadTextFilter } from "./content-filter.mjs";
 import { parseGithubCookie } from "./github-cookie.mjs";
+import { SessionRepairError } from "./session-repair.mjs";
 
 // AgentRouter (agentrouter.org) for magpie / OpenCode.
 //
@@ -999,6 +1000,7 @@ export const AgentRouterAuthPlugin = async (input, options = {}) => {
   codexHeaders = () => input?.magpie?.option?.(PROVIDER, "send-codex-headers") !== false;
   const portableResponses = () => input?.magpie?.option?.(PROVIDER, "portable-responses") !== false;
   const textFilterEnabled = () => input?.magpie?.option?.(PROVIDER, "text-filter") !== false;
+  const sessionRepairEnabled = () => input?.magpie?.option?.(PROVIDER, "codex-session-repair") === true;
   return {
     // The provider before anyone signs in: the models the vendor serves, so the
     // row has something to show, and the shape each listed one takes.
@@ -1172,10 +1174,19 @@ export const AgentRouterAuthPlugin = async (input, options = {}) => {
             applyHeaders(h, headersOf(provider, auth));
             if (key) h.set("Authorization", `Bearer ${key}`);
             const requestInit = { ...init, headers: h };
-            const prepared = await prepareRequest(input, requestInit, {
-              portableResponses: portableResponses(),
-              textFilter: textFilterEnabled() ? textFilter : null,
-            });
+            let prepared;
+            try {
+              prepared = await prepareRequest(input, requestInit, {
+                portableResponses: portableResponses(),
+                textFilter: textFilterEnabled() ? textFilter : null,
+                sessionRepair: sessionRepairEnabled(),
+              });
+            } catch (error) {
+              if (!(error instanceof SessionRepairError)) throw error;
+              return Response.json({ error: {
+                type: "invalid_request_error", code: error.code, message: error.message,
+              } }, { status: 400 });
+            }
             return explainResponse(await fetch(input, prepared), {
               retryAfterSeconds: meta(auth, "retryAfterSeconds") ?? options?.retryAfterSeconds,
             });
@@ -1190,22 +1201,29 @@ export const AgentRouterAuthPlugin = async (input, options = {}) => {
       options: [
         {
           key: "text-filter",
-          label: "Filter configured prose before sending",
+          label: "发送前替换本地词表中的文字",
           default: true,
-          description: "Uses content-filter.local.json; no guessed terms. Preserves recognized Markdown code, tool data and encrypted state. Reload after editing rules.",
+          description: "使用 content-filter.local.json 中自行配置的词表，不猜测拦截词。保留可识别的 Markdown 代码、工具数据和加密状态；修改词表后需重新加载插件。",
         },
         {
           key: "portable-responses",
-          label: "Replay complete Responses items inline",
-          description: "Remove resource-local IDs only when inline content is available; preserve call_id and encrypted content. Reference-only history still requires the original resource. Off disables ID replay only; text-filter is independent.",
+          label: "内联发送完整的 Responses 历史",
+          description: "仅在内容完整可内联时移除资源绑定的条目 ID，保留 call_id 和加密内容。只有引用的历史仍依赖原资源；关闭只停用无损内联，文字替换和有损会话清理各自独立。",
           default: true,
         },
         {
           key: "send-codex-headers",
-          label: "Send the Codex client headers",
+          label: "发送 Codex 客户端请求头",
           description:
-            "AgentRouter's gateway only answers clients it recognises. On, requests are sent as a Codex CLI's; off, only the headers you gave are sent.",
+            "AgentRouter 仅接受受认可的客户端标识。开启时附带 Codex CLI 的默认 User-Agent；关闭时不添加该标识，仍发送自行配置的请求头和默认 Accept。",
           default: true,
+        },
+        {
+          key: "codex-session-repair",
+          label: "清理 Codex 会话的旧资源绑定（有损）",
+          description: "默认关闭。发送前清理旧资源 ID、加密/压缩历史及仅引用条目，保留明文消息和工具关联。可能丢失压缩上下文；不修改本地会话文件或数据库，与无损内联和文字替换独立。",
+          confirm: "开启后会丢弃发送副本中的加密、压缩及仅引用历史，可能丢失上下文。不会修复本地日志或数据库；关闭后下一次请求恢复原有处理。确认开启？",
+          default: false,
         },
       ],
     },

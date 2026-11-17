@@ -278,7 +278,7 @@ test("filtering and inline replay compose without dropping call IDs or changing 
 
 test("installed loader honors all independent options and their enabled defaults", async t => {
   const dir = await directory(t);
-  for (const name of ["index.mjs", "request.mjs", "body-inspection.mjs", "response.mjs", "content-filter.mjs", "github-cookie.mjs"]) {
+  for (const name of ["index.mjs", "request.mjs", "body-inspection.mjs", "response.mjs", "content-filter.mjs", "github-cookie.mjs", "session-repair.mjs"]) {
     await copyFile(new URL(name, import.meta.url), join(dir, name));
   }
   await writeFile(join(dir, "content-filter.local.json"), JSON.stringify({ terms: ["private-term"] }));
@@ -319,7 +319,7 @@ test("installed loader honors all independent options and their enabled defaults
 
 test("installed loader reads private rules, supports the off switch and never retries a blocked request", async t => {
   const dir = await directory(t);
-  for (const file of ["index.mjs", "request.mjs", "body-inspection.mjs", "response.mjs", "content-filter.mjs", "github-cookie.mjs"]) await copyFile(new URL(file, import.meta.url), join(dir, file));
+  for (const file of ["index.mjs", "request.mjs", "body-inspection.mjs", "response.mjs", "content-filter.mjs", "github-cookie.mjs", "session-repair.mjs"]) await copyFile(new URL(file, import.meta.url), join(dir, file));
   await writeFile(join(dir, "content-filter.local.json"), JSON.stringify({ terms: ["private-term"] }));
   const plugin = (await import(pathToFileURL(join(dir, "index.mjs")).href)).default;
   const originalFetch = globalThis.fetch; t.after(() => { globalThis.fetch = originalFetch; });

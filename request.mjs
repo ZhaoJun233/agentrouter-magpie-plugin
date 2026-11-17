@@ -1,5 +1,6 @@
 import { redactResponsesBody } from "./content-filter.mjs";
 import { readCloneText } from "./body-inspection.mjs";
+import { repairSessionResources } from "./session-repair.mjs";
 
 // Replay complete items inline instead of asking a load-balanced resource to
 // retrieve them by an old item ID. Never remove call_id or opaque contents.
@@ -44,8 +45,8 @@ export async function prepareResponsesRequest(input, init = {}) {
   return prepareRequest(input, init);
 }
 
-export async function prepareRequest(input, init = {}, { portableResponses = true, textFilter = null } = {}) {
-  if (!portableResponses && !textFilter) return init;
+export async function prepareRequest(input, init = {}, { portableResponses = true, textFilter = null, sessionRepair = false } = {}) {
+  if (!portableResponses && !textFilter && !sessionRepair) return init;
   const request = input instanceof Request ? input : null;
   let pathname;
   try { pathname = new URL(request ? request.url : input).pathname; } catch { return init; }
@@ -63,11 +64,13 @@ export async function prepareRequest(input, init = {}, { portableResponses = tru
   let body;
   try { body = JSON.parse(text); } catch { return init; }
   if (!body || typeof body !== "object" || Array.isArray(body)) return init;
+  const repaired = sessionRepair === true ? repairSessionResources(body) : { body, changed: false };
+  body = repaired.body;
   const filtered = redactResponsesBody(body, textFilter);
   body = filtered.body;
   const replayed = portableResponses && replayInline(body);
-  if (!filtered.replacements && !replayed) return init;
-  if (replayed) body.store = false;
+  if (!repaired.changed && !filtered.replacements && !replayed) return init;
+  if (repaired.changed || replayed) body.store = false;
   for (const name of ["content-length", "content-md5", "digest", "content-digest"]) headers.delete(name);
   return { ...init, body: JSON.stringify(body), headers };
 }
