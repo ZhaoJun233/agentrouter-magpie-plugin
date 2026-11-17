@@ -8,12 +8,12 @@
 - [安全政策](<SECURITY.md>)：敏感信息处理与私密漏洞报告。
 
 - [优化设计与升级指南](<docs/OPTIMIZATION.md>)：问题背景、与参考项目的取舍、兼容边界、升级/回滚与本地验证。
-- [更新日志](<CHANGELOG.md>)：0.1.9 可配置限流等待、原生插件选项与历史版本的变化。
+- [更新日志](<CHANGELOG.md>)：0.1.10 会话资源清理、中文功能选项与历史版本的变化。
 - [本地签到说明](<LOCAL-CHECKIN.md>)：独立签到工具的使用与安全边界。
 
 > 仓库源码更新不等于 npm 发布或你的网关已升级。请按升级指南自行验证；不要把真实 Cookie、访问令牌、私有词表或抓包提交到仓库。
 
-### 本地源码新增：会话资源清理与中文功能选项
+### 0.1.10：会话资源清理与中文功能选项
 
 在 **AgentRouter 提供商编辑页** 的功能开关中配置以下选项，保存后下一次请求读取新值，无需重新登录。它们属于提供商的 `auth.options`，不是「插件 → 选项」里的 `retryAfterSeconds` JSON 配置。
 
@@ -24,7 +24,7 @@
 | 发送 Codex 客户端请求头 | `send-codex-headers` | 开启 |
 | 清理 Codex 会话的旧资源绑定（有损） | `codex-session-repair` | **关闭** |
 
-最后一项按提供的离线修复工具适配为**网关发送前清理**。支持确认提示的宿主会在开启时要求确认；关闭后下一次请求恢复原有处理，在途请求不回滚。新功能尚未发布到 npm，安装已发布的 0.1.9 不会自动获得这些源码改动。
+最后一项按提供的离线修复工具适配为**网关发送前清理**。支持确认提示的宿主会在开启时要求确认；关闭后下一次请求恢复原有处理，在途请求不回滚。此功能与中文选项说明从 0.1.10 起提供；仍使用 0.1.9 的宿主需要升级插件，升级不会自动开启有损清理。
 
 **风险与边界：**
 
@@ -51,7 +51,7 @@
 - **移除 LinuxDo OAuth 登录入口。** 真实验证结论：`connect.linux.do` 授权后回落到站点注册路由 `https://agentrouter.org/oauth/linuxdo`（并非请求里的 `/oauth/linuxdo/magpie` 子路径），站点前端在该路由挂载时立即请求 `/api/oauth/linuxdo`（真实验证记录到 1 次、HTTP 403）并跳转控制台，地址栏不再保留 `code`/`state`，插件侧手动回填在任何兑换请求之前即被拒绝。公开资料没有关于 LinuxDo redirect_uri 匹配语义的说明，站点前端确认该路由为精确匹配且没有任何可抑制自动兑换的标志位。
 - 移除范围包含 LinuxDo 方法、其常量、`/api/status` 的 `linuxdo_client_id` 读取与死代码 `codeOf`；GitHub 登录链路、提问形状与密钥筛选规则不变。
 
-> **本页登录流程适用于 0.1.9。** 下方命令固定该版本，安装前先查询 npm 官方 registry；源码版本号不等于已发布或你的网关已升级。0.1.7 曾发布 LinuxDo 登录入口，0.1.8 已将其移除，这不改变 0.1.7 已安装账号保存的数据。
+> **本页登录流程适用于 0.1.10。** 下方命令固定该版本，安装前先查询 npm 官方 registry；源码版本号不等于已发布或你的网关已升级。0.1.7 曾发布 LinuxDo 登录入口，0.1.8 已将其移除，这不改变 0.1.7 已安装账号保存的数据。
 
 ### 0.1.7：站点选择与 LinuxDo 登录
 
@@ -75,7 +75,7 @@
 
 ### 0.1.4 变更
 
-- 历史版本改进了系统令牌遮蔽输入和可选签到配置；当前操作请以下文 0.1.9 登录流程为准。
+- 历史版本改进了系统令牌遮蔽输入和可选签到配置；当前操作请以下文 0.1.10 登录流程为准。
 - 修复完整历史消息含空 `logprobs: []` 时漏掉内联重放的情况，保留工具关联、非空概率数据、引用注释和不透明状态。
 - 无法恢复仅存在于其他上游资源的历史或加密状态；这是范围受限的兼容补充，并非所有跨资源错误的通用解法。
 
@@ -91,19 +91,19 @@
 
 ```bash
 # 在有 Node.js / npm 的终端查询目标版本；确认可用后再安装
-npm view opencode-agentrouter-auth@0.1.9 version --registry=https://registry.npmjs.org
+npm view opencode-agentrouter-auth@0.1.10 version --registry=https://registry.npmjs.org
 
 # Docker：查询成功后安装，容器名按你的实际部署修改
-docker exec magpie magpie plugin add npm:opencode-agentrouter-auth@0.1.9
+docker exec magpie magpie plugin add npm:opencode-agentrouter-auth@0.1.10
 
 # 或者，本地 / 原生进程部署
-magpie plugin add npm:opencode-agentrouter-auth@0.1.9
+magpie plugin add npm:opencode-agentrouter-auth@0.1.10
 ```
 
 - Docker 与原生进程命令二选一。安装后用 `magpie plugin list --json`（Docker 中在命令前加 `docker exec magpie`）核对插件，再在面板检查 AgentRouter 的插件选项和登录状态。
 - 如果版本查询返回 `E404`，该版本在所查 registry 尚不可用；不要把源码版本号当成 npm 已发布证明，可改用下方源码安装。若仅宿主安装失败，可运行 `magpie plugin registry` 检查它实际使用的 registry；查询命令不会替你修改宿主设置。
 - 已用本地目录安装的用户，继续更新原目录即可；不要直接再添加一份 npm 插件。先备份并确认宿主如何关联插件路径、认证及选项，再决定是否迁移，避免重复注册或丢失原配置。
-- 固定 `@0.1.9` 便于复现；省略版本会让宿主选择版本，但并不等同于更新所有插件。`magpie plugin update` 则可能更新其他插件，不作为本插件的定点升级步骤。
+- 固定 `@0.1.10` 便于复现；省略版本会让宿主选择版本，但并不等同于更新所有插件。`magpie plugin update` 则可能更新其他插件，不作为本插件的定点升级步骤。
 - 已通过 npm 安装的用户，升级或降级前须确认当前宿主的**单包替换方式以及认证/选项保留行为**；未确认前暂停操作，不直接重复执行 `plugin add`。旧版本也须经 npm 查询确认存在，不能假设仓库旧版本都已发布。下方[升级/回滚指南](<docs/OPTIMIZATION.md#11-升级与回退>)针对本地包/目录备份，不是已验证的 npm 定点降级流程。
 
 #### Docker 源码安装
@@ -131,9 +131,9 @@ magpie plugin add /path/to/agentrouter-magpie-plugin
 
 ---
 
-### 2. 登录并绑定账号（0.1.9）
+### 2. 登录并绑定账号（0.1.10）
 
-以下流程适用于已加载 0.1.9 的宿主，沿用 0.1.8 的登录方式；0.1.7 及更早版本的菜单不同（0.1.7 的 LinuxDo 入口已在 0.1.8 移除）。新账号运行交互式登录命令（升级既有账号不要求重新登录）：
+以下流程适用于已加载 0.1.10 的宿主，沿用 0.1.8 的登录方式；0.1.7 及更早版本的菜单不同（0.1.7 的 LinuxDo 入口已在 0.1.8 移除）。新账号运行交互式登录命令（升级既有账号不要求重新登录）：
 ```bash
 docker exec -it magpie magpie plugin login agentrouter
 # 非 Docker 环境直接运行：magpie plugin login agentrouter
@@ -645,12 +645,13 @@ docker exec magpie magpie plugin options word-guard '{
 ```bash
 npm test                 # Node.js 插件与本地签到回归
 npm run test:session-repair # 会话资源清理、开关与中文说明专项回归
+npm run test:policy      # PR 元数据规则回归
 npm run test:headers     # 需要 Python 3；仅执行维护脚本的 Python 部分，不调用 Docker
 ```
 
 ## 文件
 
-| `index.mjs` — 插件本体（provider + 自定义头 + 余额 + 签到 + GitHub / 系统访问令牌登录）
+- `index.mjs` — 插件本体（provider + 自定义头 + 余额 + 签到 + GitHub / 系统访问令牌登录）
 - `response.mjs` — HTTP / SSE 早期失败识别与有界流透传（安装时必须一起复制）
 - `session-repair.mjs` — 默认关闭的发送前会话资源清理，不修改本地日志或数据库（安装时必须一起复制）
 - `package.json` — 包描述
