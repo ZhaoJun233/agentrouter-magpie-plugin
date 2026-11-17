@@ -1,6 +1,6 @@
 {
   "name": "opencode-agentrouter-auth",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "适用于 magpie 和 OpenCode 的 AgentRouter 插件：国际/国内站选择、API Key/GitHub/系统访问令牌登录、自定义请求头、余额与签到、文字替换、历史内联及可选的 Codex 会话资源清理",
   "type": "module",
   "main": "./index.mjs",
